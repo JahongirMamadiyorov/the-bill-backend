@@ -2,8 +2,8 @@ const { Pool } = require('pg');
 const dns = require('dns');
 require('dotenv').config();
 
-// Force IPv4 resolution — Render free tier cannot reach IPv6 addresses
 dns.setDefaultResultOrder('ipv4first');
+dns.setServers(['8.8.8.8', '1.1.1.1']);
 
 // Build pool config.
 // Prefer individual PG* env vars (avoids $ and special-char issues in DATABASE_URL).

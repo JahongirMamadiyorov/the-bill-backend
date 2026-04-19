@@ -1,10 +1,16 @@
--- v9: table_sections — shared section list across app and website
-CREATE TABLE IF NOT EXISTS table_sections (
-  id   SERIAL PRIMARY KEY,
-  name TEXT NOT NULL UNIQUE
-);
-
--- Seed the three default sections (ignore if they already exist)
-INSERT INTO table_sections (name)
-VALUES ('Indoor'), ('Outdoor'), ('Terrace')
-ON CONFLICT (name) DO NOTHING;
+-- DEPRECATED — DO NOT RUN.
+--
+-- This file previously contained a SINGLE-TENANT table_sections schema:
+--   CREATE TABLE table_sections (id SERIAL PRIMARY KEY, name TEXT UNIQUE)
+--   INSERT INTO table_sections (name) VALUES ('Indoor'), ('Outdoor'), ('Terrace')
+--
+-- That schema is incompatible with the production multi-tenant table defined
+-- in schema.sql, which carries `restaurant_id UUID NOT NULL` and a composite
+-- UNIQUE(restaurant_id, name). Running the old DDL would either silently
+-- conflict (CREATE IF NOT EXISTS no-op + seed inserts violating NOT NULL),
+-- or — worse — drop multi-tenant data on a fresh DB.
+--
+-- The seeding of default sections per restaurant now happens in
+-- routes/super-admin.js when a restaurant is created. This file is kept as a
+-- no-op so any historical reference to it doesn't error.
+SELECT 1;

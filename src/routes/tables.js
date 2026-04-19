@@ -3,20 +3,34 @@ const router = express.Router();
 const db = require('../config/db');
 const { authenticate, authorize, rid } = require('../middleware/auth');
 
-// ── Ensure table_sections table exists (runs on every request if needed) ─────
+// ── Ensure table_sections table exists (multi-tenant schema) ────────────────
+// The real schema lives in src/config/schema.sql:
+//   CREATE TABLE table_sections (
+//     id            SERIAL PRIMARY KEY,
+//     restaurant_id UUID NOT NULL REFERENCES restaurants(id) ON DELETE CASCADE,
+//     name          TEXT NOT NULL,
+//     UNIQUE(restaurant_id, name)
+//   );
+// A single-tenant CREATE TABLE here without restaurant_id would clash with the
+// real schema and any seeded INSERTs without restaurant_id would violate the
+// NOT NULL constraint. Per-restaurant defaults are seeded by super-admin when
+// a restaurant is created. Here we only ensure the table exists in dev DBs.
 const ENSURE_SQL = `
   CREATE TABLE IF NOT EXISTS table_sections (
-    id   SERIAL PRIMARY KEY,
-    name TEXT NOT NULL UNIQUE
+    id            SERIAL PRIMARY KEY,
+    restaurant_id UUID NOT NULL,
+    name          TEXT NOT NULL,
+    UNIQUE(restaurant_id, name)
   );
-  INSERT INTO table_sections (name)
-  VALUES ('Indoor'),('Outdoor'),('Terrace')
-  ON CONFLICT (name) DO NOTHING;
 `;
 let sectionsTableReady = false;
 async function ensureSectionsTable() {
   if (sectionsTableReady) return;
-  await db.query(ENSURE_SQL);
+  try {
+    await db.query(ENSURE_SQL);
+  } catch (_) {
+    // Table likely already exists with the full schema — that's fine.
+  }
   sectionsTableReady = true;
 }
 // Run once on startup
@@ -56,7 +70,28 @@ router.delete('/sections/:name', authenticate, authorize('owner', 'admin'), asyn
   try {
     await ensureSectionsTable();
     const restaurantId = rid(req);
-    await db.query(`DELETE FROM table_sections WHERE name = $1 AND restaurant_id = $2`, [req.params.name, restaurantId]);
+    const name = req.params.name;
+
+    // Refuse to drop a section that's still referenced by tables — otherwise
+    // the GET endpoint's UNION fallback would immediately resurrect it from
+    // restaurant_tables and the chip would pop back, making the delete look
+    // broken. Compare case-insensitively so chip-matched names reliably hit.
+    const refs = await db.query(
+      `SELECT COUNT(*)::int AS n FROM restaurant_tables
+       WHERE restaurant_id = $1 AND LOWER(section) = LOWER($2)`,
+      [restaurantId, name]
+    );
+    if ((refs.rows[0]?.n || 0) > 0) {
+      return res.status(409).json({ error: 'Section still has tables. Move or delete them first.' });
+    }
+
+    // Case-insensitive name match so a chip click reliably removes the row
+    // even if its stored casing doesn't match what the UI displayed.
+    await db.query(
+      `DELETE FROM table_sections
+       WHERE restaurant_id = $1 AND LOWER(name) = LOWER($2)`,
+      [restaurantId, name]
+    );
     res.json({ ok: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
