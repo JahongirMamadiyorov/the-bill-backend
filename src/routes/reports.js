@@ -138,7 +138,7 @@ router.get('/admin-daily-summary', authenticate, authorize('owner', 'admin'), as
         FROM users u
         JOIN shifts s ON s.user_id = u.id AND s.clock_in::date = $1 AND s.restaurant_id = $2
         LEFT JOIN orders o ON o.waitress_id = u.id AND o.created_at::date = $1 AND o.restaurant_id = $2
-        WHERE u.role = 'waitress'
+        WHERE u.role = 'waitress' AND u.restaurant_id = $2
         GROUP BY u.name, s.clock_in, s.clock_out
       `, [today, restaurantId]),
       db.query(`

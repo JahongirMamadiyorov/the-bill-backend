@@ -169,6 +169,7 @@ router.get('/payroll', authenticate, authorize('owner', 'admin'), async (req, re
        FROM users u
        LEFT JOIN shifts s ON u.id = s.user_id AND s.restaurant_id = $3 AND s.clock_in::date BETWEEN $1 AND $2
        WHERE u.is_active = true
+         AND u.restaurant_id = $3
          AND u.role IN ('owner','admin','waitress','kitchen','manager','cashier','cleaner')
        GROUP BY u.id, u.name, u.role, u.salary, u.salary_type, u.commission_rate
        ORDER BY u.name`,
@@ -250,6 +251,7 @@ router.get('/admin/staff-status', authenticate, authorize('owner', 'admin'), asy
                          clock_in DESC NULLS LAST
             ) s ON u.id = s.user_id
             WHERE u.is_active = true
+              AND u.restaurant_id = $1
               AND u.role IN ('waitress', 'kitchen', 'cashier', 'cleaner', 'manager')
             ORDER BY u.role, u.name
         `, [restaurant_id]);

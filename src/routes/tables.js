@@ -96,6 +96,67 @@ router.delete('/sections/:name', authenticate, authorize('owner', 'admin'), asyn
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// PATCH /api/tables/sections/:name — rename a section
+// Body: { newName: string }
+// Updates the `table_sections` row AND every `restaurant_tables.section`
+// that currently points at the old name, so the chip and every table card
+// stay in sync. Case-insensitive match on the old name.
+router.patch('/sections/:name', authenticate, authorize('owner', 'admin'), async (req, res) => {
+  try {
+    await ensureSectionsTable();
+    const restaurantId = rid(req);
+    const oldName = req.params.name;
+    const newName = String(req.body?.newName || '').trim();
+
+    if (!newName) {
+      return res.status(400).json({ error: 'New section name required' });
+    }
+    if (newName.length > 80) {
+      return res.status(400).json({ error: 'Section name too long' });
+    }
+    if (newName.toLowerCase() === oldName.toLowerCase()) {
+      return res.json({ ok: true, unchanged: true });
+    }
+
+    // Reject if another section with the new name already exists (unless
+    // that row is the old one itself via a pure-casing change, handled above).
+    const clash = await db.query(
+      `SELECT 1 FROM table_sections
+       WHERE restaurant_id = $1 AND LOWER(name) = LOWER($2)`,
+      [restaurantId, newName]
+    );
+    if (clash.rows.length) {
+      return res.status(409).json({ error: 'A section with that name already exists' });
+    }
+
+    // Update the registry row (case-insensitive match on old name).
+    await db.query(
+      `UPDATE table_sections SET name = $3
+       WHERE restaurant_id = $1 AND LOWER(name) = LOWER($2)`,
+      [restaurantId, oldName, newName]
+    );
+
+    // Keep every table that referenced the old name in sync, otherwise the
+    // GET /sections union would resurrect the old name from restaurant_tables.
+    await db.query(
+      `UPDATE restaurant_tables SET section = $3
+       WHERE restaurant_id = $1 AND LOWER(section) = LOWER($2)`,
+      [restaurantId, oldName, newName]
+    );
+
+    // Safety net: ensure the new section exists as a registry row even if
+    // the registry had no prior row for the old name (historical data path).
+    await db.query(
+      `INSERT INTO table_sections (name, restaurant_id)
+       VALUES ($1, $2)
+       ON CONFLICT (restaurant_id, name) DO NOTHING`,
+      [newName, restaurantId]
+    );
+
+    res.json({ ok: true, oldName, newName });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // GET /api/tables
 router.get('/', authenticate, async (req, res) => {
   try {

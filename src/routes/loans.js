@@ -108,9 +108,10 @@ router.post('/notify-overdue', authenticate, async (req, res) => {
       return res.json({ notified: 0, overdueCount: 0, message: 'No overdue loans' });
     }
 
-    // Find all admin and owner users to notify
+    // Find all admin and owner users to notify (scoped to this restaurant only)
     const adminRes = await db.query(
-      `SELECT id FROM users WHERE role IN ('admin', 'owner') AND is_active IS NOT FALSE`
+      `SELECT id FROM users WHERE role IN ('admin', 'owner') AND restaurant_id = $1 AND is_active IS NOT FALSE`,
+      [restaurantId]
     );
     const admins = adminRes.rows;
 

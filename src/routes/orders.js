@@ -728,7 +728,10 @@ router.post('/', authenticate, async (req, res) => {
     // Create notifications for kitchen users asynchronously
     (async () => {
       try {
-        const kitchenUsers = await db.query("SELECT id FROM users WHERE role='kitchen'");
+        const kitchenUsers = await db.query(
+          "SELECT id FROM users WHERE role='kitchen' AND restaurant_id=$1 AND is_active IS NOT FALSE",
+          [rid(req)]
+        );
 
         let notifTitle, notifBody;
         if (order_type === 'to_go') {
@@ -874,21 +877,23 @@ router.put('/:id/status', authenticate, async (req, res) => {
       (async () => {
         try {
           const tableRes   = await db.query("SELECT table_number FROM restaurant_tables WHERE id=$1 AND restaurant_id=$2", [order.table_id, order.restaurant_id]);
-          const waitressRes= await db.query("SELECT name FROM users WHERE id=$1", [order.waitress_id]);
+          const waitressRes= await db.query("SELECT name FROM users WHERE id=$1 AND restaurant_id=$2", [order.waitress_id, order.restaurant_id]);
           const tNum       = tableRes.rows[0]?.table_number || '?';
           const waitress   = waitressRes.rows[0]?.name || 'Waitress';
           const total      = parseFloat(order.total_amount || 0).toLocaleString('uz-UZ');
           const now        = new Date().toLocaleTimeString('uz-UZ', { hour: '2-digit', minute: '2-digit' });
           const body       = `Table ${tNum} · ${total} so'm · ${waitress} · ${now}`;
 
-          // Primary: send to cashiers
+          // Primary: send to cashiers in THIS restaurant only
           let recipients = await db.query(
-            "SELECT id FROM users WHERE role='cashier' AND is_active IS NOT FALSE"
+            "SELECT id FROM users WHERE role='cashier' AND restaurant_id=$1 AND is_active IS NOT FALSE",
+            [order.restaurant_id]
           );
-          // Fallback: if no cashiers, send to admins/owners
+          // Fallback: if no cashiers, send to admins/owners in THIS restaurant only
           if (recipients.rows.length === 0) {
             recipients = await db.query(
-              "SELECT id FROM users WHERE role IN ('admin','owner') AND is_active IS NOT FALSE"
+              "SELECT id FROM users WHERE role IN ('admin','owner') AND restaurant_id=$1 AND is_active IS NOT FALSE",
+              [order.restaurant_id]
             );
           }
           for (const u of recipients.rows) {
@@ -1181,10 +1186,13 @@ router.post('/:id/items', authenticate, async (req, res) => {
        WHERE oi.order_id=$1 ORDER BY oi.created_at ASC`, [req.params.id, req.params.id]
     );
 
-    // Notify kitchen of updated order
+    // Notify kitchen of updated order (scoped to this restaurant only)
     (async () => {
       try {
-        const kitchenUsers = await db.query("SELECT id FROM users WHERE role='kitchen'");
+        const kitchenUsers = await db.query(
+          "SELECT id FROM users WHERE role='kitchen' AND restaurant_id=$1 AND is_active IS NOT FALSE",
+          [rid(req)]
+        );
         for (const u of kitchenUsers.rows) {
           await db.query(
             "INSERT INTO notifications (user_id, title, body, type, restaurant_id) VALUES ($1,$2,$3,$4,$5)",
