@@ -53,13 +53,17 @@ router.post('/upload-image', authenticate, upload.single('image'), (req, res) =>
   } catch (e) { console.error('menu_item_ingredients migration error:', e.message); }
 })();
 
-// ── Auto-migration: add item_type, kitchen_station, sort_order to menu_items ───
+// ── Auto-migration: add item_type, kitchen_station, sort_order, unit to menu_items ───
 ;(async () => {
   try {
     await db.query(`ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS item_type VARCHAR(20) DEFAULT 'food'`);
     await db.query(`ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS kitchen_station VARCHAR(50) DEFAULT NULL`);
     await db.query(`ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS sort_order INTEGER DEFAULT 0`);
+    await db.query(`ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS unit VARCHAR(10) DEFAULT 'piece'`);
+    await db.query(`UPDATE menu_items SET unit = 'piece' WHERE unit IS NULL`);
     await db.query(`ALTER TABLE categories ADD COLUMN IF NOT EXISTS sort_order INTEGER DEFAULT 0`);
+    // Allow fractional quantities (kg / l items)
+    await db.query(`ALTER TABLE order_items ALTER COLUMN quantity TYPE NUMERIC(10,3) USING quantity::numeric`);
   } catch (e) { console.error('menu migration error:', e.message); }
 })();
 
@@ -194,15 +198,22 @@ router.get('/items/:id', authenticate, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// Allowed unit values — anything else is normalised to 'piece'
+const ALLOWED_UNITS = new Set(['piece', 'kg', 'l', 'g', 'ml']);
+const normaliseUnit = (u) => {
+  const v = String(u || '').toLowerCase().trim();
+  return ALLOWED_UNITS.has(v) ? v : 'piece';
+};
+
 // POST /api/menu/items
 router.post('/items', authenticate, authorize('owner', 'admin'), async (req, res) => {
-  const { category_id, name, description, price, image_url, item_type, kitchen_station } = req.body;
+  const { category_id, name, description, price, image_url, item_type, kitchen_station, unit } = req.body;
   try {
     const restaurant_id = rid(req);
     const result = await db.query(
-      `INSERT INTO menu_items (restaurant_id, category_id, name, description, price, image_url, item_type, kitchen_station)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
-      [restaurant_id, category_id, name, description, price, image_url, item_type || 'food', kitchen_station || null]
+      `INSERT INTO menu_items (restaurant_id, category_id, name, description, price, image_url, item_type, kitchen_station, unit)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+      [restaurant_id, category_id, name, description, price, image_url, item_type || 'food', kitchen_station || null, normaliseUnit(unit)]
     );
     res.status(201).json(result.rows[0]);
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -210,20 +221,22 @@ router.post('/items', authenticate, authorize('owner', 'admin'), async (req, res
 
 // PUT /api/menu/items/:id
 router.put('/items/:id', authenticate, authorize('owner', 'admin'), async (req, res) => {
-  const { category_id, name, description, price, image_url, is_available, available, item_type, kitchen_station, sort_order } = req.body;
+  const { category_id, name, description, price, image_url, is_available, available, item_type, kitchen_station, sort_order, unit } = req.body;
   try {
     const restaurant_id = rid(req);
     const result = await db.query(
       `UPDATE menu_items
        SET category_id=$1, name=$2, description=$3, price=$4, image_url=$5,
-           is_available=$6, item_type=$7, kitchen_station=$8, sort_order=COALESCE($9, sort_order), updated_at=NOW()
-       WHERE id=$10 AND restaurant_id=$11 RETURNING *`,
+           is_available=$6, item_type=$7, kitchen_station=$8, sort_order=COALESCE($9, sort_order),
+           unit=COALESCE($10, unit), updated_at=NOW()
+       WHERE id=$11 AND restaurant_id=$12 RETURNING *`,
       [
         category_id, name, description, price, image_url,
         is_available ?? available ?? true,
         item_type || 'food',
         kitchen_station || null,
         sort_order !== undefined ? sort_order : null,
+        unit !== undefined ? normaliseUnit(unit) : null,
         req.params.id,
         restaurant_id,
       ]

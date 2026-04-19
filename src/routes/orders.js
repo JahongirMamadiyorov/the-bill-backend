@@ -153,7 +153,8 @@ router.get('/', authenticate, async (req, res) => {
       const itemsRes = await db.query(
         `SELECT oi.id, oi.order_id, oi.menu_item_id, oi.quantity, oi.unit_price,
                 COALESCE(m.name, 'Unknown item') AS name,
-                COALESCE(m.name, 'Unknown item') AS item_name
+                COALESCE(m.name, 'Unknown item') AS item_name,
+                COALESCE(m.unit, 'piece') AS unit
          FROM order_items oi
          LEFT JOIN menu_items m ON oi.menu_item_id = m.id
          WHERE oi.order_id = ANY($1::uuid[])`,
@@ -236,7 +237,7 @@ router.get('/kitchen', authenticate, authorize('owner', 'admin', 'kitchen'), asy
     if (userStation) {
       // Only fetch items that belong to this station OR have no station assigned
       itemsResult = await db.query(
-        `SELECT oi.*, COALESCE(m.name, 'Unknown item') as name, COALESCE(m.name, 'Unknown item') as item_name, m.kitchen_station, oi.item_ready
+        `SELECT oi.*, COALESCE(m.name, 'Unknown item') as name, COALESCE(m.name, 'Unknown item') as item_name, COALESCE(m.unit, 'piece') AS unit, m.kitchen_station, oi.item_ready, COALESCE(m.unit, 'piece') AS unit
          FROM order_items oi
          LEFT JOIN menu_items m ON oi.menu_item_id = m.id
          WHERE oi.order_id = ANY($1::uuid[])
@@ -246,7 +247,7 @@ router.get('/kitchen', authenticate, authorize('owner', 'admin', 'kitchen'), asy
     } else {
       // No station filter — return all items
       itemsResult = await db.query(
-        `SELECT oi.*, COALESCE(m.name, 'Unknown item') as name, COALESCE(m.name, 'Unknown item') as item_name, m.kitchen_station, oi.item_ready
+        `SELECT oi.*, COALESCE(m.name, 'Unknown item') as name, COALESCE(m.name, 'Unknown item') as item_name, COALESCE(m.unit, 'piece') AS unit, m.kitchen_station, oi.item_ready, COALESCE(m.unit, 'piece') AS unit
          FROM order_items oi
          LEFT JOIN menu_items m ON oi.menu_item_id = m.id
          WHERE oi.order_id = ANY($1::uuid[])`,
@@ -354,7 +355,7 @@ router.get('/kitchen/completed', authenticate, authorize('owner', 'admin', 'kitc
 
     const orderIds = ordersResult.rows.map(o => o.id);
     const itemsResult = await db.query(
-      `SELECT oi.*, m.name as item_name, m.kitchen_station
+      `SELECT oi.*, m.name as item_name, m.kitchen_station, COALESCE(m.unit, 'piece') AS unit
        FROM order_items oi
        LEFT JOIN menu_items m ON oi.menu_item_id = m.id
        WHERE oi.order_id = ANY($1::uuid[])`,
@@ -481,7 +482,7 @@ router.get('/:id', authenticate, async (req, res) => {
     );
     if (!order.rows[0]) return res.status(404).json({ error: 'Order not found' });
     const items = await db.query(
-      `SELECT oi.*, COALESCE(m.name, 'Unknown item') as name, COALESCE(m.name, 'Unknown item') as item_name
+      `SELECT oi.*, COALESCE(m.name, 'Unknown item') as name, COALESCE(m.name, 'Unknown item') as item_name, COALESCE(m.unit, 'piece') AS unit
        FROM order_items oi LEFT JOIN menu_items m ON oi.menu_item_id=m.id AND m.restaurant_id = (SELECT restaurant_id FROM orders WHERE id=$2)
        WHERE oi.order_id=$1`, [req.params.id, req.params.id]
     );
@@ -605,7 +606,7 @@ router.put('/:id', authenticate, authorize('owner', 'admin'), async (req, res) =
        WHERE o.id=$1 AND o.restaurant_id=$2`, [req.params.id, rid(req)]
     );
     const updatedItems = await db.query(
-      `SELECT oi.*, COALESCE(m.name, 'Unknown item') as name, COALESCE(m.name, 'Unknown item') as item_name
+      `SELECT oi.*, COALESCE(m.name, 'Unknown item') as name, COALESCE(m.name, 'Unknown item') as item_name, COALESCE(m.unit, 'piece') AS unit
        FROM order_items oi LEFT JOIN menu_items m ON oi.menu_item_id=m.id AND m.restaurant_id = (SELECT restaurant_id FROM orders WHERE id=$2)
        WHERE oi.order_id=$1`, [req.params.id, req.params.id]
     );
@@ -807,7 +808,7 @@ router.put('/:id/status', authenticate, async (req, res) => {
           } catch (_) { continue; }
 
           for (const recipe of bom.rows) {
-            const totalQtyToDeduct = parseFloat(recipe.quantity_used) * parseInt(item.quantity);
+            const totalQtyToDeduct = parseFloat(recipe.quantity_used) * parseFloat(item.quantity);
             let remainingToDeduct = totalQtyToDeduct;
 
             // Fetch batches FIFO (stock_batches may not exist — skip gracefully)
@@ -1053,7 +1054,7 @@ router.put('/:id/pay', authenticate, async (req, res) => {
              WHERE mii.menu_item_id=$1`, [item.menu_item_id]
           );
           for (const ing of bom.rows) {
-            const qtyUsed = parseFloat(ing.quantity_used) * parseInt(item.quantity);
+            const qtyUsed = parseFloat(ing.quantity_used) * parseFloat(item.quantity);
             await client.query(
               'UPDATE warehouse_items SET quantity_in_stock = GREATEST(0, quantity_in_stock - $1), updated_at=NOW() WHERE id=$2',
               [qtyUsed, ing.ingredient_id]
@@ -1175,7 +1176,7 @@ router.post('/:id/items', authenticate, async (req, res) => {
        WHERE o.id=$1 AND o.restaurant_id=$2`, [req.params.id, rid(req)]
     );
     const updatedItems = await db.query(
-      `SELECT oi.*, COALESCE(m.name, 'Unknown item') as name, COALESCE(m.name, 'Unknown item') as item_name
+      `SELECT oi.*, COALESCE(m.name, 'Unknown item') as name, COALESCE(m.name, 'Unknown item') as item_name, COALESCE(m.unit, 'piece') AS unit
        FROM order_items oi LEFT JOIN menu_items m ON oi.menu_item_id=m.id AND m.restaurant_id = (SELECT restaurant_id FROM orders WHERE id=$2)
        WHERE oi.order_id=$1 ORDER BY oi.created_at ASC`, [req.params.id, req.params.id]
     );

@@ -52,11 +52,12 @@ function buildEscPos(r) {
   d += CMD.DOUBLE_ON;
   d += (r.restaurantName || 'Restaurant') + '\n';
   d += CMD.NORMAL;
-  d += CMD.BOLD_OFF;
 
-  // Order info
+  // Order info — keep BOLD on so order number, table name and date are crisp
+  d += CMD.BOLD_ON;
   d += (r.orderNum || '') + '  ' + (r.tableName || '') + '\n';
   d += (r.dateTime || '') + '\n';
+  d += CMD.BOLD_OFF;
   d += CMD.LEFT;
   d += dashes();
 
@@ -64,7 +65,11 @@ function buildEscPos(r) {
   if (Array.isArray(r.items) && r.items.length > 0) {
     r.items.forEach(item => {
       const name  = String(item.name || '—');
-      const qty   = `x${item.qty || item.quantity || 1}`;
+      const rawQty = parseFloat(item.qty ?? item.quantity) || 1;
+      const u = String(item.unit || 'piece').toLowerCase();
+      const weighed = u === 'kg' || u === 'l' || u === 'g' || u === 'ml';
+      const qtyStr = Number.isInteger(rawQty) ? String(rawQty) : parseFloat(rawQty.toFixed(3)).toString();
+      const qty   = weighed ? `${qtyStr}${u}` : `x${qtyStr}`;
       const price = String(item.total || item.price || '');
 
       // Name line — truncate if long
@@ -113,18 +118,22 @@ function buildEscPos(r) {
   d += CMD.BOLD_OFF;
   d += dashes();
 
-  // Payment info
+  // Payment info — bold so the payment method stands out
+  d += CMD.BOLD_ON;
   d += pad('Method', RECEIPT_WIDTH - String(r.method || '').length)
      + (r.method || '') + '\n';
   if (r.change && r.change !== '0') {
     d += pad('Change', RECEIPT_WIDTH - String(r.change).length)
        + r.change + '\n';
   }
+  d += CMD.BOLD_OFF;
 
-  // Footer — centered
+  // Footer — centered, bold so thank-you message is clearly visible
   d += dashes();
   d += CMD.CENTER;
+  d += CMD.BOLD_ON;
   d += (r.footer || 'Thank you for dining with us!') + '\n';
+  d += CMD.BOLD_OFF;
 
   // Feed + cut
   d += CMD.FEED(4);
