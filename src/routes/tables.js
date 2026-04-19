@@ -106,7 +106,7 @@ router.patch('/sections/:name', authenticate, authorize('owner', 'admin'), async
     await ensureSectionsTable();
     const restaurantId = rid(req);
     const oldName = req.params.name;
-    const newName = String(req.body?.newName || '').trim();
+    const newName = String(req.body?.newName ?? req.body?.new_name ?? '').trim();
 
     if (!newName) {
       return res.status(400).json({ error: 'New section name required' });
