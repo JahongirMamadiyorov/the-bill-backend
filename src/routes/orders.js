@@ -501,7 +501,7 @@ router.get('/:id', authenticate, async (req, res) => {
 });
 
 // PUT /api/orders/:id — update order details (table, waitress, notes, items, payment_method)
-router.put('/:id', authenticate, authorize('owner', 'admin'), async (req, res) => {
+router.put('/:id', authenticate, authorize('owner', 'admin', 'cashier'), async (req, res) => {
   const { table_id, waitress_id, guest_count, notes, items, payment_method } = req.body;
   const client = await db.connect();
   try {
