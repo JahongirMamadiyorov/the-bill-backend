@@ -501,7 +501,11 @@ router.get('/:id', authenticate, async (req, res) => {
 });
 
 // PUT /api/orders/:id — update order details (table, waitress, notes, items, payment_method)
-router.put('/:id', authenticate, authorize('owner', 'admin', 'cashier'), async (req, res) => {
+// Waitresses also need to update their own orders (e.g. adding items to a bill_requested
+// order from the active-order modal). Authorization is still scoped per restaurant by
+// the `WHERE restaurant_id=...` filter below, and waitresses can't change role-restricted
+// fields (payment_method, cancellation, etc.) from their UI.
+router.put('/:id', authenticate, authorize('owner', 'admin', 'cashier', 'waitress'), async (req, res) => {
   const { table_id, waitress_id, guest_count, notes, items, payment_method } = req.body;
   const client = await db.connect();
   try {
