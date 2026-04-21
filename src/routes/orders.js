@@ -561,6 +561,12 @@ router.put('/:id', authenticate, authorize('owner', 'admin', 'cashier'), async (
 
       vals.push(taxAmount); sets.push(`tax_amount=$${vals.length}`);
       vals.push(total);     sets.push(`total_amount=$${vals.length}`);
+
+      // If the items list changed on a bill_requested/ready/served order,
+      // reset status to pending so kitchen picks the change up.
+      if (['bill_requested', 'ready', 'served'].includes(existing.rows[0].status)) {
+        vals.push('pending'); sets.push(`status=$${vals.length}`);
+      }
     }
 
     // Always run the UPDATE (at minimum touches updated_at)
@@ -1127,7 +1133,9 @@ router.post('/:id/items', authenticate, async (req, res) => {
       return res.status(404).json({ error: 'Order not found' });
     }
     const order = existing.rows[0];
-    if (order.status === 'bill_requested' || order.status === 'paid' || order.status === 'cancelled') {
+    // Adding items is blocked only for finalised orders — bill_requested is allowed
+    // (the cashier/waitress may still add items after the customer has asked for the bill).
+    if (order.status === 'paid' || order.status === 'cancelled') {
       await client.query('ROLLBACK');
       return res.status(400).json({ error: `Cannot add items to an order with status: ${order.status}` });
     }
@@ -1164,9 +1172,11 @@ router.post('/:id/items', authenticate, async (req, res) => {
       [total, taxAmount, req.params.id]
     );
 
-    // Reset to pending so kitchen sees the new items
+    // Reset to pending so kitchen sees the new items.
+    // bill_requested is included — if the customer already asked for the bill and then
+    // adds more items, we re-open the order for the kitchen.
     await client.query(
-      `UPDATE orders SET status='pending', updated_at=NOW() WHERE id=$1 AND status IN ('ready','served')`,
+      `UPDATE orders SET status='pending', updated_at=NOW() WHERE id=$1 AND status IN ('ready','served','bill_requested')`,
       [req.params.id]
     );
 
