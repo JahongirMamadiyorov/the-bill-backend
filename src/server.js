@@ -55,6 +55,7 @@ app.use('/api/loans',         require('./routes/loans'));
 app.use('/api/finance',       require('./routes/finance'));
 app.use('/api/print',         require('./routes/print'));
 app.use('/api/super-admin',   require('./routes/super-admin'));
+app.use('/api/settings',      require('./routes/settings'));
 
 // Health check
 app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: new Date() }));
