@@ -48,10 +48,8 @@ router.put('/', authenticate, authorize(...ALLOWED_ROLES), async (req, res) => {
       tax_enabled,
       service_charge_rate,
       service_charge_enabled,
-      // Main receipt printer
-      printer_ip,
-      printer_port,
-      // Kitchen printers (JSONB array)
+      // Printers (JSONB arrays)
+      receipt_printers,
       kitchen_printers,
       // Receipt toggles
       receipt_show_logo,
@@ -76,8 +74,7 @@ router.put('/', authenticate, authorize(...ALLOWED_ROLES), async (req, res) => {
          restaurant_id, restaurant_name, address, phone, logo_url, currency_symbol,
          receipt_header, receipt_footer,
          tax_rate, tax_enabled, service_charge_rate, service_charge_enabled,
-         printer_ip, printer_port,
-         kitchen_printers,
+         receipt_printers, kitchen_printers,
          receipt_show_logo, receipt_show_tax, receipt_show_service_charge,
          receipt_show_footer, receipt_show_order_number, receipt_show_table_name,
          kitchen_show_table_name, kitchen_show_order_number, kitchen_show_customer_name,
@@ -85,9 +82,9 @@ router.put('/', authenticate, authorize(...ALLOWED_ROLES), async (req, res) => {
          kitchen_show_order_type, kitchen_show_item_price, kitchen_show_qty_unit,
          updated_at
        ) VALUES (
-         $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,
-         $15::jsonb,
-         $16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,now()
+         $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
+         $13::jsonb, $14::jsonb,
+         $15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,now()
        )
        ON CONFLICT (restaurant_id) DO UPDATE SET
          restaurant_name         = EXCLUDED.restaurant_name,
@@ -101,9 +98,8 @@ router.put('/', authenticate, authorize(...ALLOWED_ROLES), async (req, res) => {
          tax_enabled             = EXCLUDED.tax_enabled,
          service_charge_rate     = EXCLUDED.service_charge_rate,
          service_charge_enabled  = EXCLUDED.service_charge_enabled,
-         printer_ip              = EXCLUDED.printer_ip,
-         printer_port            = EXCLUDED.printer_port,
-         kitchen_printers        = EXCLUDED.kitchen_printers,
+         receipt_printers             = EXCLUDED.receipt_printers,
+         kitchen_printers             = EXCLUDED.kitchen_printers,
          receipt_show_logo            = EXCLUDED.receipt_show_logo,
          receipt_show_tax             = EXCLUDED.receipt_show_tax,
          receipt_show_service_charge  = EXCLUDED.receipt_show_service_charge,
@@ -133,8 +129,7 @@ router.put('/', authenticate, authorize(...ALLOWED_ROLES), async (req, res) => {
         tax_enabled            ?? false,
         service_charge_rate    ?? 0,
         service_charge_enabled ?? false,
-        printer_ip             ?? null,
-        printer_port           ?? 9100,
+        JSON.stringify(receipt_printers ?? []),
         JSON.stringify(kitchen_printers ?? []),
         receipt_show_logo            ?? true,
         receipt_show_tax             ?? true,
