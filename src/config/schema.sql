@@ -522,13 +522,36 @@ CREATE TABLE tax_settings (
 -- ============================================================
 
 CREATE TABLE restaurant_settings (
-  id                      SERIAL PRIMARY KEY,
-  restaurant_id           UUID NOT NULL UNIQUE REFERENCES restaurants(id) ON DELETE CASCADE,
-  restaurant_name         TEXT,
-  receipt_header          TEXT,
-  service_charge_rate     NUMERIC DEFAULT 0,
-  service_charge_enabled  BOOLEAN DEFAULT FALSE,
-  updated_at              TIMESTAMPTZ DEFAULT NOW()
+  id                           SERIAL PRIMARY KEY,
+  restaurant_id                UUID NOT NULL UNIQUE REFERENCES restaurants(id) ON DELETE CASCADE,
+  restaurant_name              TEXT,
+  address                      TEXT,
+  phone                        TEXT,
+  logo_url                     TEXT,
+  currency_symbol              TEXT DEFAULT 'so''m',
+  receipt_header               TEXT,
+  receipt_footer               TEXT,
+  tax_rate                     NUMERIC DEFAULT 0,
+  tax_enabled                  BOOLEAN DEFAULT FALSE,
+  service_charge_rate          NUMERIC DEFAULT 0,
+  service_charge_enabled       BOOLEAN DEFAULT FALSE,
+  receipt_printers             JSONB DEFAULT '[]',
+  kitchen_printers             JSONB DEFAULT '[]',
+  receipt_show_logo            BOOLEAN DEFAULT TRUE,
+  receipt_show_tax             BOOLEAN DEFAULT TRUE,
+  receipt_show_service_charge  BOOLEAN DEFAULT TRUE,
+  receipt_show_footer          BOOLEAN DEFAULT TRUE,
+  receipt_show_order_number    BOOLEAN DEFAULT TRUE,
+  receipt_show_table_name      BOOLEAN DEFAULT TRUE,
+  kitchen_show_order_type      BOOLEAN DEFAULT TRUE,
+  kitchen_show_table_name      BOOLEAN DEFAULT TRUE,
+  kitchen_show_order_number    BOOLEAN DEFAULT TRUE,
+  kitchen_show_customer_name   BOOLEAN DEFAULT TRUE,
+  kitchen_show_qty_unit        BOOLEAN DEFAULT TRUE,
+  kitchen_show_item_price      BOOLEAN DEFAULT FALSE,
+  kitchen_show_notes           BOOLEAN DEFAULT TRUE,
+  kitchen_show_timestamp       BOOLEAN DEFAULT TRUE,
+  updated_at                   TIMESTAMPTZ DEFAULT NOW()
 );
 
 -- ============================================================

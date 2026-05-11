@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const db = require('../config/db');
 const { authenticate, authorize, rid } = require('../middleware/auth');
+const { sendKitchenPrintJobs } = require('../utils/kitchenPrint');
 
 // ── Auto-migration: item_ready per-item readiness tracking ────────────────────
 ;(async () => {
@@ -764,6 +765,29 @@ router.post('/', authenticate, async (req, res) => {
       } catch (e) { console.error('Kitchen notification error:', e.message); }
     })();
 
+    // ── Auto-print to kitchen printers (fire-and-forget) ──────────────────
+    // We need items with their kitchen_station so the helper can route them
+    // to the right printer. Fetch a fresh list right after COMMIT.
+    (async () => {
+      try {
+        const orderItemsRes = await db.query(
+          `SELECT oi.menu_item_id, oi.quantity, oi.notes, m.kitchen_station, m.name
+           FROM order_items oi
+           LEFT JOIN menu_items m ON oi.menu_item_id = m.id
+           WHERE oi.order_id = $1`,
+          [order.id]
+        );
+        const tableRes = await db.query('SELECT name, table_number FROM restaurant_tables WHERE id=$1', [table_id || '00000000-0000-0000-0000-000000000000']);
+        const tableRow = tableRes.rows[0];
+        await sendKitchenPrintJobs({
+          db,
+          restaurantId: rid(req),
+          order: { ...order, table_number: tableRow?.table_number || tableRow?.name || null },
+          items: orderItemsRes.rows,
+        });
+      } catch (e) { console.warn('[kitchenPrint] post-order error:', e.message); }
+    })();
+
     res.status(201).json(order);
   } catch (err) {
     await client.query('ROLLBACK');
@@ -1214,6 +1238,31 @@ router.post('/:id/items', authenticate, async (req, res) => {
           );
         }
       } catch (e) { console.error('Kitchen add-items notification error:', e.message); }
+    })();
+
+    // ── Auto-print newly added items to kitchen printers (fire-and-forget) ──
+    (async () => {
+      try {
+        // Only print the items just added (by matching the ids we inserted above)
+        const newItemsRes = await db.query(
+          `SELECT oi.menu_item_id, oi.quantity, oi.notes, m.kitchen_station, m.name
+           FROM order_items oi
+           LEFT JOIN menu_items m ON oi.menu_item_id = m.id
+           WHERE oi.order_id = $1
+           ORDER BY oi.created_at DESC
+           LIMIT $2`,
+          [req.params.id, items.length]
+        );
+        await sendKitchenPrintJobs({
+          db,
+          restaurantId: rid(req),
+          order: {
+            ...updatedOrder.rows[0],
+            table_number: updatedOrder.rows[0]?.table_number || null,
+          },
+          items: newItemsRes.rows,
+        });
+      } catch (e) { console.warn('[kitchenPrint] add-items print error:', e.message); }
     })();
 
     res.json({ ...updatedOrder.rows[0], items: updatedItems.rows });
