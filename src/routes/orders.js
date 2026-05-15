@@ -3,6 +3,7 @@ const router = express.Router();
 const db = require('../config/db');
 const { authenticate, authorize, rid } = require('../middleware/auth');
 const { sendKitchenPrintJobs } = require('../utils/kitchenPrint');
+const { broadcast }            = require('../utils/wsClients');
 
 // ── Auto-migration: item_ready per-item readiness tracking ────────────────────
 ;(async () => {
@@ -778,13 +779,12 @@ router.post('/', authenticate, async (req, res) => {
           [order.id]
         );
         const tableRes = await db.query('SELECT name, table_number FROM restaurant_tables WHERE id=$1', [table_id || '00000000-0000-0000-0000-000000000000']);
-        const tableRow = tableRes.rows[0];
-        await sendKitchenPrintJobs({
-          db,
-          restaurantId: rid(req),
-          order: { ...order, table_number: tableRow?.table_number || tableRow?.name || null },
-          items: orderItemsRes.rows,
-        });
+        const tableRow  = tableRes.rows[0];
+        const printOrder = { ...order, table_number: tableRow?.table_number || tableRow?.name || null };
+        // Push to cashier panel WebSocket (real-time LAN print)
+        broadcast(rid(req), { type: 'kitchen_print', order: printOrder, items: orderItemsRes.rows });
+        // Also attempt direct TCP from Render (no-op when printer is on LAN only)
+        await sendKitchenPrintJobs({ db, restaurantId: rid(req), order: printOrder, items: orderItemsRes.rows });
       } catch (e) { console.warn('[kitchenPrint] post-order error:', e.message); }
     })();
 
@@ -1253,15 +1253,11 @@ router.post('/:id/items', authenticate, async (req, res) => {
            LIMIT $2`,
           [req.params.id, items.length]
         );
-        await sendKitchenPrintJobs({
-          db,
-          restaurantId: rid(req),
-          order: {
-            ...updatedOrder.rows[0],
-            table_number: updatedOrder.rows[0]?.table_number || null,
-          },
-          items: newItemsRes.rows,
-        });
+        const addOrder = { ...updatedOrder.rows[0], table_number: updatedOrder.rows[0]?.table_number || null };
+        // Push to cashier panel WebSocket (real-time LAN print)
+        broadcast(rid(req), { type: 'kitchen_print', order: addOrder, items: newItemsRes.rows });
+        // Also attempt direct TCP from Render (no-op when printer is on LAN only)
+        await sendKitchenPrintJobs({ db, restaurantId: rid(req), order: addOrder, items: newItemsRes.rows });
       } catch (e) { console.warn('[kitchenPrint] add-items print error:', e.message); }
     })();
 

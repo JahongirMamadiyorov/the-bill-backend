@@ -3,7 +3,7 @@ const router   = express.Router();
 const db       = require('../config/db');
 const { authenticate, authorize, rid } = require('../middleware/auth');
 
-const ALLOWED_ROLES = ['admin', 'owner', 'super_admin'];
+const ALLOWED_ROLES = ['admin', 'owner', 'super_admin', 'cashier'];
 
 // ── GET /api/settings ─────────────────────────────────────────────────────────
 router.get('/', authenticate, authorize(...ALLOWED_ROLES), async (req, res) => {
