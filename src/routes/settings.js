@@ -148,6 +148,26 @@ router.put('/', authenticate, authorize(...ALLOWED_ROLES), async (req, res) => {
       ]
     );
 
+    // ── Keep tax_settings table in sync so all app roles see the same value ──
+    // tax_enabled / tax_rate in restaurant_settings is the admin-controlled source;
+    // the cashier and accounting routes read from tax_settings — sync them here.
+    const syncRate    = tax_rate    ?? 0;
+    const syncEnabled = tax_enabled ?? false;
+    const existingTax = await db.query(
+      'SELECT id FROM tax_settings WHERE restaurant_id=$1 LIMIT 1', [restaurantId]
+    );
+    if (existingTax.rows[0]) {
+      await db.query(
+        'UPDATE tax_settings SET rate=$1, is_active=$2 WHERE id=$3',
+        [syncRate, syncEnabled, existingTax.rows[0].id]
+      );
+    } else {
+      await db.query(
+        'INSERT INTO tax_settings (restaurant_id, name, rate, is_active) VALUES ($1,$2,$3,$4)',
+        [restaurantId, 'Tax', syncRate, syncEnabled]
+      );
+    }
+
     res.json(result.rows[0]);
   } catch (err) {
     console.error('PUT /settings error:', err);
