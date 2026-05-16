@@ -25,7 +25,7 @@ const CMD = {
   CUT:          GS  + 'V\x41\x05', // Partial cut
 };
 
-const RECEIPT_WIDTH = 32; // chars for 80mm paper at standard font
+const RECEIPT_WIDTH = 48; // chars for 80mm paper at standard font
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 const pad = (str, len) => {
@@ -41,44 +41,68 @@ const rpad = (str, len) => {
 const dashes = () => '-'.repeat(RECEIPT_WIDTH) + '\n';
 
 // ── Format receipt as ESC/POS string ─────────────────────────────────────────
+// r.show flags (all default true if absent):
+//   show.logo, show.orderNumber, show.tableName,
+//   show.tax, show.serviceCharge, show.footer
 function buildEscPos(r) {
-  let d = '';
+  const show = {
+    logo:          r.show?.logo          !== false,
+    orderNumber:   r.show?.orderNumber   !== false,
+    tableName:     r.show?.tableName     !== false,
+    tax:           r.show?.tax           !== false,
+    serviceCharge: r.show?.serviceCharge !== false,
+    footer:        r.show?.footer        !== false,
+  };
 
+  let d = '';
   d += CMD.INIT;
 
-  // Header — restaurant name (large bold centered)
+  // ── Header — restaurant name (large bold centered) ────────────────────────
+  if (show.logo) {
+    d += CMD.CENTER;
+    d += CMD.BOLD_ON;
+    d += CMD.DOUBLE_ON;
+    d += (r.restaurantName || 'Restaurant') + '\n';
+    d += CMD.NORMAL;
+    d += CMD.BOLD_OFF;
+  }
+
+  // ── Header text (tagline / receipt_header) ────────────────────────────────
+  if (r.headerText) {
+    d += CMD.CENTER;
+    d += r.headerText + '\n';
+  }
+
+  // ── Order info ────────────────────────────────────────────────────────────
   d += CMD.CENTER;
   d += CMD.BOLD_ON;
-  d += CMD.DOUBLE_ON;
-  d += (r.restaurantName || 'Restaurant') + '\n';
-  d += CMD.NORMAL;
-
-  // Order info — keep BOLD on so order number, table name and date are crisp
-  d += CMD.BOLD_ON;
-  d += (r.orderNum || '') + '  ' + (r.tableName || '') + '\n';
+  const metaLine = [
+    show.orderNumber && r.orderNum ? r.orderNum : '',
+    show.tableName   && r.tableName ? r.tableName : '',
+  ].filter(Boolean).join('  ');
+  if (metaLine) d += metaLine + '\n';
   d += (r.dateTime || '') + '\n';
   d += CMD.BOLD_OFF;
+
   d += CMD.LEFT;
   d += dashes();
 
-  // Items
+  // ── Items ──────────────────────────────────────────────────────────────────
   if (Array.isArray(r.items) && r.items.length > 0) {
     r.items.forEach(item => {
-      const name  = String(item.name || '—');
-      const rawQty = parseFloat(item.qty ?? item.quantity) || 1;
-      const u = String(item.unit || 'piece').toLowerCase();
+      const name    = String(item.name || '—');
+      const rawQty  = parseFloat(item.qty ?? item.quantity) || 1;
+      const u       = String(item.unit || 'piece').toLowerCase();
       const weighed = u === 'kg' || u === 'l' || u === 'g' || u === 'ml';
-      const qtyStr = Number.isInteger(rawQty) ? String(rawQty) : parseFloat(rawQty.toFixed(3)).toString();
-      const qty   = weighed ? `${qtyStr}${u}` : `x${qtyStr}`;
-      const price = String(item.total || item.price || '');
+      const qtyStr  = Number.isInteger(rawQty) ? String(rawQty) : parseFloat(rawQty.toFixed(3)).toString();
+      const qty     = weighed ? `${qtyStr} ${u}` : `x${qtyStr}`;
+      const price   = String(item.total || item.price || '');
 
-      // Name line — truncate if long
       if (name.length <= RECEIPT_WIDTH - qty.length - price.length - 2) {
         d += pad(name, RECEIPT_WIDTH - qty.length - price.length - 1)
            + qty + ' '
            + rpad(price, price.length) + '\n';
       } else {
-        // Name wraps to 2 lines
         d += name.substring(0, RECEIPT_WIDTH) + '\n';
         d += pad('', RECEIPT_WIDTH - qty.length - price.length - 1)
            + qty + ' '
@@ -89,18 +113,15 @@ function buildEscPos(r) {
 
   d += dashes();
 
-  // Subtotal / tax / service / discount
+  // ── Subtotal / tax / service / discount ───────────────────────────────────
   if (r.subtotal && r.subtotal !== r.total) {
-    d += pad('Subtotal', RECEIPT_WIDTH - String(r.subtotal).length)
-       + r.subtotal + '\n';
+    d += pad('Subtotal', RECEIPT_WIDTH - String(r.subtotal).length) + r.subtotal + '\n';
   }
-  if (r.tax) {
-    d += pad(`Tax (${r.taxRate || ''}%)`, RECEIPT_WIDTH - String(r.tax).length)
-       + r.tax + '\n';
+  if (show.tax && r.tax) {
+    d += pad(`Tax (${r.taxRate || ''}%)`, RECEIPT_WIDTH - String(r.tax).length) + r.tax + '\n';
   }
-  if (r.service) {
-    d += pad(`Service (${r.serviceRate || ''}%)`, RECEIPT_WIDTH - String(r.service).length)
-       + r.service + '\n';
+  if (show.serviceCharge && r.service) {
+    d += pad(`Service (${r.serviceRate || ''}%)`, RECEIPT_WIDTH - String(r.service).length) + r.service + '\n';
   }
   if (r.discount) {
     d += pad(`Discount${r.discountReason ? ' (' + r.discountReason + ')' : ''}`,
@@ -108,32 +129,32 @@ function buildEscPos(r) {
        + r.discount + '\n';
   }
 
-  // Total (bold, double-height)
+  // ── Total — bold, double-height ────────────────────────────────────────────
   d += dashes();
   d += CMD.BOLD_ON;
   d += CMD.DOUBLE_ON;
-  d += pad('TOTAL', RECEIPT_WIDTH - String(r.total || '').length)
-     + (r.total || '') + '\n';
+  d += pad('TOTAL', RECEIPT_WIDTH - String(r.total || '').length) + (r.total || '') + '\n';
   d += CMD.NORMAL;
   d += CMD.BOLD_OFF;
   d += dashes();
 
-  // Payment info — bold so the payment method stands out
+  // ── Payment method / change ───────────────────────────────────────────────
   d += CMD.BOLD_ON;
-  d += pad('Method', RECEIPT_WIDTH - String(r.method || '').length)
-     + (r.method || '') + '\n';
+  d += pad('Method', RECEIPT_WIDTH - String(r.method || '').length) + (r.method || '') + '\n';
   if (r.change && r.change !== '0') {
-    d += pad('Change', RECEIPT_WIDTH - String(r.change).length)
-       + r.change + '\n';
+    d += pad('Change', RECEIPT_WIDTH - String(r.change).length) + r.change + '\n';
   }
   d += CMD.BOLD_OFF;
 
-  // Footer — centered, bold so thank-you message is clearly visible
-  d += dashes();
-  d += CMD.CENTER;
-  d += CMD.BOLD_ON;
-  d += (r.footer || 'Thank you for dining with us!') + '\n';
-  d += CMD.BOLD_OFF;
+  // ── Footer ─────────────────────────────────────────────────────────────────
+  if (show.footer) {
+    const footerText = r.footer || 'Thank you for dining with us!';
+    d += dashes();
+    d += CMD.CENTER;
+    d += CMD.BOLD_ON;
+    d += footerText + '\n';
+    d += CMD.BOLD_OFF;
+  }
 
   // Feed + cut
   d += CMD.FEED(4);

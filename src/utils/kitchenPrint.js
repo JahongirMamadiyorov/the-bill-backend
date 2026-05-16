@@ -30,50 +30,106 @@ const CMD = {
   FEED: (n) => ESC + 'd' + String.fromCharCode(n),
   CUT:      GS  + 'V\x41\x05',
 };
-const WIDTH = 32; // chars for 58mm; use 42 for 80mm — kept at 32 for max compat
+const WIDTH = 48; // 80mm paper = 48 chars
 
-const dashes = () => '-'.repeat(WIDTH) + '\n';
+const sep = () => '='.repeat(WIDTH) + '\n';
+
+// Right-align amount with spaces: "Osh Kabob           2 dona"
+function spaceFill(name, amountStr) {
+  const spaces = Math.max(2, WIDTH - name.length - amountStr.length);
+  return name + ' '.repeat(spaces) + amountStr;
+}
 
 // ── Build ESC/POS kitchen ticket ──────────────────────────────────────────────
-function buildKitchenTicket({ orderNumber, tableName, orderType, items, stationLabel, timestamp }) {
+function buildKitchenTicket({ orderNumber, tableName, orderType, items, stationLabel,
+                               customerName, customerPhone, deliveryAddress }) {
+  const isToGo = orderType === 'to_go' || orderType === 'takeaway';
+  const isDeli = orderType === 'delivery';
+
   let d = '';
   d += CMD.INIT;
 
-  // Header: station name in big text
+  // ── 1. Station header — double-height + double-width + bold, centered ────
   d += CMD.CENTER;
-  d += CMD.BOLD_ON;
   d += CMD.DBL_ON;
+  d += CMD.BOLD_ON;
   d += (stationLabel || 'KITCHEN') + '\n';
   d += CMD.NORMAL;
   d += CMD.BOLD_OFF;
 
-  // Order meta
-  d += CMD.BOLD_ON;
-  d += `#${orderNumber || '?'}`;
-  if (tableName) d += `  ${tableName}`;
-  d += '\n';
-  d += CMD.BOLD_OFF;
-  if (orderType && orderType !== 'dine_in') {
-    d += orderType.toUpperCase() + '\n';
-  }
-  d += (timestamp || new Date().toLocaleTimeString()) + '\n';
-
-  d += CMD.LEFT;
-  d += dashes();
-
-  // Items
-  for (const item of items) {
-    const qty  = item.quantity || 1;
-    const name = String(item.name || item.item_name || '—');
+  // ── 2. Table name — bold, centered (dine-in only) ─────────────────────────
+  if (!isToGo && !isDeli && tableName) {
+    d += CMD.CENTER;
     d += CMD.BOLD_ON;
-    d += `x${qty}  ${name}\n`;
+    d += tableName + '\n';
     d += CMD.BOLD_OFF;
+  }
+
+  // ── 3. Order number + date + time ─────────────────────────────────────────
+  const now  = new Date();
+  const dd   = String(now.getDate()).padStart(2, '0');
+  const mm   = String(now.getMonth() + 1).padStart(2, '0');
+  const yyyy = now.getFullYear();
+  const hh   = String(now.getHours()).padStart(2, '0');
+  const min  = String(now.getMinutes()).padStart(2, '0');
+  const datetimeStr = `${dd}.${mm}.${yyyy}  ${hh}:${min}`;
+
+  d += CMD.CENTER;
+  if (orderNumber) d += `#${orderNumber}   `;
+  d += datetimeStr + '\n';
+
+  // ── 4. Separator ──────────────────────────────────────────────────────────
+  d += CMD.LEFT;
+  d += sep();
+
+  // ── 5. Items — double-height + bold, space-padded amount ──────────────────
+  for (const item of items) {
+    const qty       = item.quantity || 1;
+    const name      = String(item.name || item.item_name || '—');
+    const unit      = item.unit || 'piece';
+    const amountStr = `${qty} ${unit}`;
+
+    const maxNameLen = WIDTH - amountStr.length - 2;
+    const safeName   = name.length > maxNameLen ? name.slice(0, maxNameLen) : name;
+
+    d += CMD.BOLD_ON;
+    // ESC ! 0x18 = double-height + bold
+    d += ESC + '!\x18';
+    d += spaceFill(safeName, amountStr) + '\n';
+    d += CMD.NORMAL;
+    d += CMD.BOLD_OFF;
+
     if (item.notes) {
-      d += `     * ${item.notes}\n`;
+      d += `  * ${item.notes}\n`;
     }
   }
 
-  d += dashes();
+  // ── 6. Separator ──────────────────────────────────────────────────────────
+  d += sep();
+
+  // ── 7. Order type — double-height + bold, centered ────────────────────────
+  const typeLabel = isDeli ? 'DELIVERY' : isToGo ? 'TO GO' : 'DINE IN';
+  d += CMD.CENTER;
+  d += ESC + '!\x18'; // double-height + bold
+  d += typeLabel + '\n';
+  d += CMD.NORMAL;
+
+  // ── 8. Delivery details ───────────────────────────────────────────────────
+  if (isDeli) {
+    d += CMD.LEFT;
+    if (customerName) {
+      d += CMD.BOLD_ON + customerName + '\n' + CMD.BOLD_OFF;
+    }
+    if (customerPhone) {
+      d += ESC + '!\x10'; // double-height
+      d += customerPhone + '\n';
+      d += CMD.NORMAL;
+    }
+    if (deliveryAddress) {
+      d += deliveryAddress + '\n';
+    }
+  }
+
   d += CMD.FEED(4);
   d += CMD.CUT;
   return d;
@@ -109,12 +165,17 @@ function sendToPrinter(ip, port, escposStr) {
  */
 async function sendKitchenPrintJobs({ db, restaurantId, order, items }) {
   try {
-    // 1. Load kitchen printers config
+    // 1. Load full settings (printers + show flags)
     const settingsRes = await db.query(
-      'SELECT kitchen_printers FROM restaurant_settings WHERE restaurant_id=$1',
+      `SELECT kitchen_printers,
+              kitchen_show_table_name, kitchen_show_order_number,
+              kitchen_show_customer_name, kitchen_show_notes,
+              kitchen_show_timestamp, kitchen_show_order_type, kitchen_show_qty_unit
+       FROM restaurant_settings WHERE restaurant_id=$1`,
       [restaurantId]
     );
-    const kitchenPrinters = settingsRes.rows[0]?.kitchen_printers;
+    const row = settingsRes.rows[0] || {};
+    const kitchenPrinters = row.kitchen_printers;
     if (!Array.isArray(kitchenPrinters) || kitchenPrinters.length === 0) return;
 
     // 2. Fetch kitchen_station for any items that don't already have it
@@ -133,8 +194,16 @@ async function sendKitchenPrintJobs({ db, restaurantId, order, items }) {
       }));
     }
 
-    // 3. For each kitchen printer, collect the items it should print
-    const timestamp = new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+    // 3. Parse show flags (default all to true except item_price)
+    const b = (v, def = true) => (v === undefined || v === null ? def : Boolean(v));
+    const show = {
+      tableName:    b(row.kitchen_show_table_name),
+      orderNumber:  b(row.kitchen_show_order_number),
+      customerName: b(row.kitchen_show_customer_name),
+      notes:        b(row.kitchen_show_notes),
+      orderType:    b(row.kitchen_show_order_type),
+      qtyUnit:      b(row.kitchen_show_qty_unit),
+    };
 
     const jobs = kitchenPrinters
       .filter(p => p && p.ip)  // must have an IP to print
@@ -163,12 +232,14 @@ async function sendKitchenPrintJobs({ db, restaurantId, order, items }) {
         : (printer.name || 'KITCHEN');
 
       const ticket = buildKitchenTicket({
-        orderNumber: order.daily_number || order.id?.slice(-4),
-        tableName:   order.table_number || order.tableName || null,
-        orderType:   order.order_type   || null,
+        orderNumber:     show.orderNumber  ? (order.daily_number || order.id?.slice(-4)) : null,
+        tableName:       show.tableName    ? (order.table_name || (order.table_number ? `Table ${order.table_number}` : null)) : null,
+        orderType:       show.orderType    ? (order.order_type || null) : null,
+        customerName:    show.customerName ? (order.customer_name || null) : null,
+        customerPhone:   order.customer_phone   || null,
+        deliveryAddress: order.delivery_address || null,
         stationLabel,
         items: printerItems,
-        timestamp,
       });
 
       return sendToPrinter(printer.ip, printer.port || 9100, ticket)

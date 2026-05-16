@@ -301,11 +301,35 @@ router.get('/restaurant-settings', authenticate, async (req, res) => {
   try {
     await ensureRestaurantSettings();
     const result = await db.query('SELECT * FROM restaurant_settings WHERE restaurant_id=$1 LIMIT 1', [restaurantId]);
-    res.json(result.rows[0] || {
-      restaurant_name: 'The Bill Restaurant',
-      receipt_header: 'Thank you for dining with us!',
-      service_charge_rate: 0,
-      service_charge_enabled: false,
+    const row = result.rows[0];
+    if (!row) {
+      return res.json({
+        restaurant_name:             'The Bill Restaurant',
+        receipt_header:              'Thank you for dining with us!',
+        receipt_footer:              '',
+        service_charge_rate:         0,
+        service_charge_enabled:      false,
+        receipt_show_logo:           true,
+        receipt_show_order_number:   true,
+        receipt_show_table_name:     true,
+        receipt_show_tax:            true,
+        receipt_show_service_charge: true,
+        receipt_show_footer:         true,
+      });
+    }
+    // Return every receipt-related field so PayModal can use the show flags
+    res.json({
+      restaurant_name:             row.restaurant_name,
+      receipt_header:              row.receipt_header,
+      receipt_footer:              row.receipt_footer,
+      service_charge_rate:         row.service_charge_rate         ?? 0,
+      service_charge_enabled:      row.service_charge_enabled      ?? false,
+      receipt_show_logo:           row.receipt_show_logo           ?? true,
+      receipt_show_order_number:   row.receipt_show_order_number   ?? true,
+      receipt_show_table_name:     row.receipt_show_table_name     ?? true,
+      receipt_show_tax:            row.receipt_show_tax            ?? true,
+      receipt_show_service_charge: row.receipt_show_service_charge ?? true,
+      receipt_show_footer:         row.receipt_show_footer         ?? true,
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
