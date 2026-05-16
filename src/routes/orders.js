@@ -772,7 +772,7 @@ router.post('/', authenticate, async (req, res) => {
     (async () => {
       try {
         const orderItemsRes = await db.query(
-          `SELECT oi.menu_item_id, oi.quantity, oi.notes, m.kitchen_station, m.name
+          `SELECT oi.menu_item_id, oi.quantity, oi.notes, m.kitchen_station, m.name, m.unit
            FROM order_items oi
            LEFT JOIN menu_items m ON oi.menu_item_id = m.id
            WHERE oi.order_id = $1`,
@@ -780,7 +780,7 @@ router.post('/', authenticate, async (req, res) => {
         );
         const tableRes = await db.query('SELECT name, table_number FROM restaurant_tables WHERE id=$1', [table_id || '00000000-0000-0000-0000-000000000000']);
         const tableRow  = tableRes.rows[0];
-        const printOrder = { ...order, table_number: tableRow?.table_number || tableRow?.name || null };
+        const printOrder = { ...order, table_number: tableRow?.table_number ?? null, table_name: tableRow?.name ?? null };
         // Push to cashier panel WebSocket (real-time LAN print)
         broadcast(rid(req), { type: 'kitchen_print', order: printOrder, items: orderItemsRes.rows });
         // Also attempt direct TCP from Render (no-op when printer is on LAN only)
@@ -1245,7 +1245,7 @@ router.post('/:id/items', authenticate, async (req, res) => {
       try {
         // Only print the items just added (by matching the ids we inserted above)
         const newItemsRes = await db.query(
-          `SELECT oi.menu_item_id, oi.quantity, oi.notes, m.kitchen_station, m.name
+          `SELECT oi.menu_item_id, oi.quantity, oi.notes, m.kitchen_station, m.name, m.unit
            FROM order_items oi
            LEFT JOIN menu_items m ON oi.menu_item_id = m.id
            WHERE oi.order_id = $1
@@ -1253,7 +1253,13 @@ router.post('/:id/items', authenticate, async (req, res) => {
            LIMIT $2`,
           [req.params.id, items.length]
         );
-        const addOrder = { ...updatedOrder.rows[0], table_number: updatedOrder.rows[0]?.table_number || null };
+        const addOrderRow = updatedOrder.rows[0];
+        let addTableName = null;
+        if (addOrderRow?.table_id) {
+          const addTableRes = await db.query('SELECT name, table_number FROM restaurant_tables WHERE id=$1', [addOrderRow.table_id]);
+          addTableName = addTableRes.rows[0]?.name ?? null;
+        }
+        const addOrder = { ...addOrderRow, table_number: addOrderRow?.table_number ?? null, table_name: addTableName };
         // Push to cashier panel WebSocket (real-time LAN print)
         broadcast(rid(req), { type: 'kitchen_print', order: addOrder, items: newItemsRes.rows });
         // Also attempt direct TCP from Render (no-op when printer is on LAN only)
