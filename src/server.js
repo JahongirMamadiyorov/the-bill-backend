@@ -1,7 +1,6 @@
 const express    = require('express');
 const cors       = require('cors');
 const path       = require('path');
-const fs         = require('fs');
 const http       = require('http');
 const { WebSocketServer } = require('ws');
 const jwt        = require('jsonwebtoken');
@@ -11,21 +10,8 @@ require('dotenv').config();
 
 const app = express();
 
-// ── Auto-migrate on startup ───────────────────────────────────────────────────
-async function runMigrations() {
-  const migrations = ['migrate_v3.sql', 'migrate_v4.sql', 'migrate_v5.sql', 'migrate_v8_finance.sql'];
-  for (const file of migrations) {
-    const migrationFile = path.join(__dirname, 'config', file);
-    if (!fs.existsSync(migrationFile)) continue;
-    try {
-      const sql = fs.readFileSync(migrationFile, 'utf8');
-      await db.query(sql);
-      console.log(`✅ ${file} applied`);
-    } catch (err) {
-      console.warn(`⚠️  Migration warning (${file}):`, err.message);
-    }
-  }
-}
+// All schema changes are consolidated in src/config/schema.sql.
+// Historical migration files have been archived to src/config/migrations_archive/.
 
 // ── Middleware ────────────────────────────────────────────────────────────────
 app.use(cors({
@@ -120,9 +106,4 @@ wss.on('connection', (ws, req) => {
 // ── Start ─────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 5000;
 
-runMigrations().then(() => {
-  server.listen(PORT, () => console.log(`🚀 Server running on port ${PORT} (HTTP + WebSocket)`));
-}).catch(err => {
-  console.error('Failed to start server:', err);
-  process.exit(1);
-});
+server.listen(PORT, () => console.log(`Server running on port ${PORT} (HTTP + WebSocket)`));

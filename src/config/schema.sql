@@ -1,7 +1,14 @@
 -- ============================================================
---  RESTAURANT APP - PostgreSQL Database Schema
+--  THE BILL - Canonical PostgreSQL Schema
 --  Multi-Restaurant Architecture
---  Roles: Owner, Admin, Cashier, Waitress, Kitchen, Manager, Cleaner
+--  Roles: super_admin, owner, admin, cashier, waitress, kitchen, manager, cleaner
+--
+--  This is the single source of truth for the database structure.
+--  All historical migration files (v2-v11) have been consolidated here
+--  and archived to src/config/migrations_archive/ for reference only.
+--
+--  To apply a fresh schema: node src/config/migrate.js
+--  To reset + rebuild:      node src/config/migrate.js --fresh
 -- ============================================================
 
 -- EXTENSIONS
@@ -56,7 +63,7 @@ CREATE TABLE users (
   email           VARCHAR(150) NOT NULL,
   phone           VARCHAR(30),
   password_hash   TEXT NOT NULL,
-  role            VARCHAR(20) NOT NULL CHECK (role IN ('super_admin','owner','admin','cashier','waitress','kitchen','manager','cleaner')),
+  role            VARCHAR(20) NOT NULL CHECK (role IN ('super_admin','owner','admin','cashier','waitress','kitchen','manager','cleaner','new_cashier','new_waiter')),
   is_active       BOOLEAN DEFAULT TRUE,
   salary          DECIMAL(12,2),
   salary_type     VARCHAR(20) DEFAULT 'monthly',

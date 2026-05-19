@@ -20,7 +20,7 @@ const { authenticate, authorize, rid } = require('../middleware/auth');
     await db.query(`ALTER TABLE users DROP CONSTRAINT IF EXISTS users_role_check`);
     await db.query(`
       ALTER TABLE users ADD CONSTRAINT users_role_check
-        CHECK (role IN ('super_admin','owner','admin','cashier','waitress','kitchen','manager','cleaner'))
+        CHECK (role IN ('super_admin','owner','admin','cashier','waitress','kitchen','manager','cleaner','new_cashier','new_waiter'))
     `);
   } catch (_) { /* columns / constraint already up to date */ }
 })();
