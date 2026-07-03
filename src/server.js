@@ -60,7 +60,7 @@ app.use((err, req, res, next) => {
 const server = http.createServer(app);
 
 // ── WebSocket server ──────────────────────────────────────────────────────────
-// Clients connect to  wss://the-bill-backend.onrender.com/ws?token=JWT
+// Clients connect to  wss://the-bill-backend-pego.onrender.com/ws?token=JWT
 // Vite proxies        ws://localhost:5173/ws  →  the above URL
 const wss = new WebSocketServer({ server, path: '/ws' });
 
