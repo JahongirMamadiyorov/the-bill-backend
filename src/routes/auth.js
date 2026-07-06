@@ -3,6 +3,7 @@ const router = express.Router();
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const db = require('../config/db');
+const { authenticate } = require('../middleware/auth');
 
 // POST /api/auth/login
 router.post('/login', async (req, res) => {
@@ -116,6 +117,39 @@ router.post('/register', async (req, res) => {
     }
     res.status(500).json({ error: err.message });
   }
+});
+
+// GET /api/auth/powersync-token -- mints a short-lived HS256 JWT for the PowerSync Service.
+// Requires an existing valid app JWT (Authorization header). See PowerSync's "Custom
+// Authentication" docs — https://docs.powersync.com/configuration/auth/custom
+router.get('/powersync-token', authenticate, (req, res) => {
+  const secret = process.env.POWERSYNC_JWT_SECRET; // base64url-encoded shared secret
+  const endpoint = process.env.POWERSYNC_URL;       // e.g. https://xxxx.powersync.journeyapps.com
+  const kid = process.env.POWERSYNC_KID || 'the-bill-ps-key';
+
+  if (!secret || !endpoint) {
+    return res.status(503).json({ error: 'PowerSync is not configured on this backend yet' });
+  }
+
+  const token = jwt.sign(
+    {
+      // Custom claims read in Sync Streams via auth.parameter('restaurant_id') — avoids
+      // needing a subquery against `users` in every stream query (PowerSync only supports
+      // subqueries in IN(...)/JOIN form, not `column = (scalar subquery)`).
+      restaurant_id: req.user.restaurant_id || null,
+      role:          req.user.role,
+    },
+    Buffer.from(secret, 'base64url'),
+    {
+      algorithm:  'HS256',
+      subject:    String(req.user.id),
+      audience:   endpoint,
+      expiresIn:  '60m',
+      header:     { kid },
+    }
+  );
+
+  res.json({ token, endpoint });
 });
 
 // GET /api/auth/restaurants -- public list for login screen
