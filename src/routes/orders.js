@@ -538,53 +538,94 @@ router.put('/:id', authenticate, authorize('owner', 'admin', 'cashier', 'waitres
     // If items provided, replace order_items and recalculate totals
     if (Array.isArray(items) && items.length > 0) {
       // ── Ingredient stock adjustment ──────────────────────────────────────
-      // This block replaces the ENTIRE order_items list below, so naively
-      // deducting stock for every item in the new list would double-count
-      // anything that was already there before the edit (its stock was
-      // already deducted when the order was first created, or by a previous
-      // edit). Fix: refund the BOM for the OLD items first (as if they'd
-      // never been ordered), then deduct the BOM for the NEW items after
-      // they're inserted below — net effect is only the real delta moves,
-      // whether items were added, removed, or had their quantity changed.
-      // This was a real bug (2026-07-08): stock never moved on order edits,
-      // only on initial order creation.
+      // This block replaces the ENTIRE order_items list below. Callers (e.g.
+      // AdminNewOrder.jsx's "mergedItems") often resend the FULL item list —
+      // old items unchanged plus one or two new ones — not just the delta.
+      // An earlier version of this fix blindly refunded every old item and
+      // deducted every new item, which logged a pointless refund+deduct pair
+      // (net zero) for every item that didn't actually change, AND showed
+      // "Edited" in the UI even when the user had only added something new.
+      // Fixed 2026-07-08 (round 2): diff the old vs. new quantities per
+      // menu_item_id first, and only touch stock for the ones that actually
+      // changed — labeled "added item" (wasn't on the order before), "removed
+      // item" (isn't anymore), or "items edited" (same item, different qty).
+      // Unchanged items are skipped entirely — no log noise, no net-zero
+      // double entry.
       const orderNumForStock = existing.rows[0].daily_number || req.params.id.slice(0, 8);
       let stockCostDelta = 0;
+
       const oldItemsForStock = await client.query(
         'SELECT menu_item_id, quantity FROM order_items WHERE order_id=$1',
         [req.params.id]
       );
+      const oldQtyMap = new Map();
+      for (const row of oldItemsForStock.rows) {
+        if (!row.menu_item_id) continue;
+        oldQtyMap.set(row.menu_item_id, (oldQtyMap.get(row.menu_item_id) || 0) + parseFloat(row.quantity));
+      }
+      const newQtyMap = new Map();
+      for (const item of items) {
+        if (!item.menu_item_id) continue;
+        const qty = Number(item.quantity || 1);
+        newQtyMap.set(item.menu_item_id, (newQtyMap.get(item.menu_item_id) || 0) + qty);
+      }
+      const touchedIds = new Set([...oldQtyMap.keys(), ...newQtyMap.keys()]);
+
       try {
-        await client.query('SAVEPOINT stock_refund_old_items');
-        for (const oldItem of oldItemsForStock.rows) {
-          if (!oldItem.menu_item_id) continue;
+        await client.query('SAVEPOINT stock_diff_items');
+        for (const menuItemId of touchedIds) {
+          const oldQty = oldQtyMap.get(menuItemId) || 0;
+          const newQty = newQtyMap.get(menuItemId) || 0;
+          const delta  = newQty - oldQty;
+          if (delta === 0) continue; // unchanged — nothing to log
+
+          const kind = oldQty === 0 ? 'added item' : (newQty === 0 ? 'removed item' : 'items edited');
+          const nameRes = await client.query('SELECT name FROM menu_items WHERE id=$1 AND restaurant_id=$2', [menuItemId, rid(req)]);
+          const itemName = nameRes.rows[0]?.name || menuItemId;
+
           const bom = await client.query(
             `SELECT mii.ingredient_id, mii.quantity_used, i.cost_per_unit
              FROM menu_item_ingredients mii
              JOIN warehouse_items i ON mii.ingredient_id = i.id
-             WHERE mii.menu_item_id=$1`, [oldItem.menu_item_id]
+             WHERE mii.menu_item_id=$1`, [menuItemId]
           );
           for (const ing of bom.rows) {
-            const qtyUsed = parseFloat(ing.quantity_used) * parseFloat(oldItem.quantity);
-            await client.query(
-              'UPDATE warehouse_items SET quantity_in_stock = quantity_in_stock + $1, updated_at=NOW() WHERE id=$2',
-              [qtyUsed, ing.ingredient_id]
-            );
-            const ingCost = parseFloat(ing.cost_per_unit || 0);
-            await client.query(
-              `INSERT INTO stock_movements (item_id, type, quantity, user_id, reason, cost_per_unit, restaurant_id)
-               VALUES ($1, 'IN', $2, $3, $4, $5, $6)`,
-              [ing.ingredient_id, qtyUsed, req.user.id,
-               `Auto: Order #${orderNumForStock} — items edited, reversing previous stock use`,
-               ingCost, rid(req)]
-            );
-            stockCostDelta -= qtyUsed * ingCost;
+            const qtyDelta = parseFloat(ing.quantity_used) * delta; // >0 = deduct more, <0 = refund
+            const ingCost  = parseFloat(ing.cost_per_unit || 0);
+            if (qtyDelta > 0) {
+              await client.query(
+                'UPDATE warehouse_items SET quantity_in_stock = GREATEST(0, quantity_in_stock - $1), updated_at=NOW() WHERE id=$2',
+                [qtyDelta, ing.ingredient_id]
+              );
+              await client.query(
+                `INSERT INTO stock_movements (item_id, type, quantity, user_id, reason, cost_per_unit, restaurant_id)
+                 VALUES ($1, 'OUT', $2, $3, $4, $5, $6)`,
+                [ing.ingredient_id, qtyDelta, req.user.id,
+                 `Auto: Order #${orderNumForStock} (${kind}) — ${newQty}x ${itemName}`,
+                 ingCost, rid(req)]
+              );
+              stockCostDelta += qtyDelta * ingCost;
+            } else {
+              const refundQty = -qtyDelta;
+              await client.query(
+                'UPDATE warehouse_items SET quantity_in_stock = quantity_in_stock + $1, updated_at=NOW() WHERE id=$2',
+                [refundQty, ing.ingredient_id]
+              );
+              await client.query(
+                `INSERT INTO stock_movements (item_id, type, quantity, user_id, reason, cost_per_unit, restaurant_id)
+                 VALUES ($1, 'IN', $2, $3, $4, $5, $6)`,
+                [ing.ingredient_id, refundQty, req.user.id,
+                 `Auto: Order #${orderNumForStock} (${kind}) — ${itemName}`,
+                 ingCost, rid(req)]
+              );
+              stockCostDelta -= refundQty * ingCost;
+            }
           }
         }
-        await client.query('RELEASE SAVEPOINT stock_refund_old_items');
+        await client.query('RELEASE SAVEPOINT stock_diff_items');
       } catch (stockErr) {
-        await client.query('ROLLBACK TO SAVEPOINT stock_refund_old_items');
-        console.warn('Stock refund skipped (order edit):', stockErr.message);
+        await client.query('ROLLBACK TO SAVEPOINT stock_diff_items');
+        console.warn('Stock diff skipped (order edit):', stockErr.message);
       }
 
       await client.query('DELETE FROM order_items WHERE order_id=$1', [req.params.id]);
@@ -604,42 +645,6 @@ router.put('/:id', authenticate, authorize('owner', 'admin', 'cashier', 'waitres
           `INSERT INTO order_items (order_id, menu_item_id, quantity, unit_price) VALUES ($1,$2,$3,$4)`,
           [req.params.id, menuItemId, qty, unitPrice]
         );
-      }
-
-      // Deduct BOM for the NEW item list (see comment above the refund block)
-      try {
-        await client.query('SAVEPOINT stock_deduct_new_items');
-        for (const item of items) {
-          const menuItemId = item.menu_item_id || null;
-          if (!menuItemId) continue;
-          const qty = Number(item.quantity || 1);
-          const bom = await client.query(
-            `SELECT mii.ingredient_id, mii.quantity_used, i.cost_per_unit
-             FROM menu_item_ingredients mii
-             JOIN warehouse_items i ON mii.ingredient_id = i.id
-             WHERE mii.menu_item_id=$1`, [menuItemId]
-          );
-          for (const ing of bom.rows) {
-            const qtyUsed = parseFloat(ing.quantity_used) * qty;
-            await client.query(
-              'UPDATE warehouse_items SET quantity_in_stock = GREATEST(0, quantity_in_stock - $1), updated_at=NOW() WHERE id=$2',
-              [qtyUsed, ing.ingredient_id]
-            );
-            const ingCost = parseFloat(ing.cost_per_unit || 0);
-            await client.query(
-              `INSERT INTO stock_movements (item_id, type, quantity, user_id, reason, cost_per_unit, restaurant_id)
-               VALUES ($1, 'OUT', $2, $3, $4, $5, $6)`,
-              [ing.ingredient_id, qtyUsed, req.user.id,
-               `Auto: Order #${orderNumForStock} — items edited, applying new stock use`,
-               ingCost, rid(req)]
-            );
-            stockCostDelta += qtyUsed * ingCost;
-          }
-        }
-        await client.query('RELEASE SAVEPOINT stock_deduct_new_items');
-      } catch (stockErr) {
-        await client.query('ROLLBACK TO SAVEPOINT stock_deduct_new_items');
-        console.warn('Stock deduction skipped (order edit):', stockErr.message);
       }
 
       // Only log a cost-of-goods expense when the edit net-increased ingredient
