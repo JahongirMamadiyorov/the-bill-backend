@@ -537,6 +537,56 @@ router.put('/:id', authenticate, authorize('owner', 'admin', 'cashier', 'waitres
 
     // If items provided, replace order_items and recalculate totals
     if (Array.isArray(items) && items.length > 0) {
+      // ── Ingredient stock adjustment ──────────────────────────────────────
+      // This block replaces the ENTIRE order_items list below, so naively
+      // deducting stock for every item in the new list would double-count
+      // anything that was already there before the edit (its stock was
+      // already deducted when the order was first created, or by a previous
+      // edit). Fix: refund the BOM for the OLD items first (as if they'd
+      // never been ordered), then deduct the BOM for the NEW items after
+      // they're inserted below — net effect is only the real delta moves,
+      // whether items were added, removed, or had their quantity changed.
+      // This was a real bug (2026-07-08): stock never moved on order edits,
+      // only on initial order creation.
+      const orderNumForStock = existing.rows[0].daily_number || req.params.id.slice(0, 8);
+      let stockCostDelta = 0;
+      const oldItemsForStock = await client.query(
+        'SELECT menu_item_id, quantity FROM order_items WHERE order_id=$1',
+        [req.params.id]
+      );
+      try {
+        await client.query('SAVEPOINT stock_refund_old_items');
+        for (const oldItem of oldItemsForStock.rows) {
+          if (!oldItem.menu_item_id) continue;
+          const bom = await client.query(
+            `SELECT mii.ingredient_id, mii.quantity_used, i.cost_per_unit
+             FROM menu_item_ingredients mii
+             JOIN warehouse_items i ON mii.ingredient_id = i.id
+             WHERE mii.menu_item_id=$1`, [oldItem.menu_item_id]
+          );
+          for (const ing of bom.rows) {
+            const qtyUsed = parseFloat(ing.quantity_used) * parseFloat(oldItem.quantity);
+            await client.query(
+              'UPDATE warehouse_items SET quantity_in_stock = quantity_in_stock + $1, updated_at=NOW() WHERE id=$2',
+              [qtyUsed, ing.ingredient_id]
+            );
+            const ingCost = parseFloat(ing.cost_per_unit || 0);
+            await client.query(
+              `INSERT INTO stock_movements (item_id, type, quantity, user_id, reason, cost_per_unit, restaurant_id)
+               VALUES ($1, 'IN', $2, $3, $4, $5, $6)`,
+              [ing.ingredient_id, qtyUsed, req.user.id,
+               `Auto: Order #${orderNumForStock} — items edited, reversing previous stock use`,
+               ingCost, rid(req)]
+            );
+            stockCostDelta -= qtyUsed * ingCost;
+          }
+        }
+        await client.query('RELEASE SAVEPOINT stock_refund_old_items');
+      } catch (stockErr) {
+        await client.query('ROLLBACK TO SAVEPOINT stock_refund_old_items');
+        console.warn('Stock refund skipped (order edit):', stockErr.message);
+      }
+
       await client.query('DELETE FROM order_items WHERE order_id=$1', [req.params.id]);
 
       let subtotal = 0;
@@ -554,6 +604,55 @@ router.put('/:id', authenticate, authorize('owner', 'admin', 'cashier', 'waitres
           `INSERT INTO order_items (order_id, menu_item_id, quantity, unit_price) VALUES ($1,$2,$3,$4)`,
           [req.params.id, menuItemId, qty, unitPrice]
         );
+      }
+
+      // Deduct BOM for the NEW item list (see comment above the refund block)
+      try {
+        await client.query('SAVEPOINT stock_deduct_new_items');
+        for (const item of items) {
+          const menuItemId = item.menu_item_id || null;
+          if (!menuItemId) continue;
+          const qty = Number(item.quantity || 1);
+          const bom = await client.query(
+            `SELECT mii.ingredient_id, mii.quantity_used, i.cost_per_unit
+             FROM menu_item_ingredients mii
+             JOIN warehouse_items i ON mii.ingredient_id = i.id
+             WHERE mii.menu_item_id=$1`, [menuItemId]
+          );
+          for (const ing of bom.rows) {
+            const qtyUsed = parseFloat(ing.quantity_used) * qty;
+            await client.query(
+              'UPDATE warehouse_items SET quantity_in_stock = GREATEST(0, quantity_in_stock - $1), updated_at=NOW() WHERE id=$2',
+              [qtyUsed, ing.ingredient_id]
+            );
+            const ingCost = parseFloat(ing.cost_per_unit || 0);
+            await client.query(
+              `INSERT INTO stock_movements (item_id, type, quantity, user_id, reason, cost_per_unit, restaurant_id)
+               VALUES ($1, 'OUT', $2, $3, $4, $5, $6)`,
+              [ing.ingredient_id, qtyUsed, req.user.id,
+               `Auto: Order #${orderNumForStock} — items edited, applying new stock use`,
+               ingCost, rid(req)]
+            );
+            stockCostDelta += qtyUsed * ingCost;
+          }
+        }
+        await client.query('RELEASE SAVEPOINT stock_deduct_new_items');
+      } catch (stockErr) {
+        await client.query('ROLLBACK TO SAVEPOINT stock_deduct_new_items');
+        console.warn('Stock deduction skipped (order edit):', stockErr.message);
+      }
+
+      // Only log a cost-of-goods expense when the edit net-increased ingredient
+      // cost — matches the existing pattern in POST / (create order), which
+      // also only logs when totalIngredientCost > 0.
+      if (stockCostDelta > 0) {
+        try {
+          await client.query(
+            `INSERT INTO expenses (category, description, amount, expense_date, recorded_by, restaurant_id)
+             VALUES ('cost_of_goods', $1, $2, CURRENT_DATE, $3, $4)`,
+            [`Ingredient cost adjustment for edited order #${orderNumForStock}`, stockCostDelta, req.user.id, rid(req)]
+          );
+        } catch (_) { /* skip if expenses table not available */ }
       }
 
       // Recalculate tax + total
@@ -1170,9 +1269,12 @@ router.post('/:id/items', authenticate, async (req, res) => {
 
     // Look up prices and insert new items
     let addedSubtotal = 0;
+    let addedIngredientCost = 0;
+    const orderNumForStock = order.daily_number || req.params.id.slice(0, 8);
     for (const item of items) {
-      const priceRes = await client.query('SELECT price FROM menu_items WHERE id=$1 AND restaurant_id=$2', [item.menu_item_id, rid(req)]);
+      const priceRes = await client.query('SELECT price, name FROM menu_items WHERE id=$1 AND restaurant_id=$2', [item.menu_item_id, rid(req)]);
       const unitPrice = priceRes.rows[0] ? Number(priceRes.rows[0].price) : 0;
+      const itemName  = priceRes.rows[0]?.name || item.menu_item_id;
       const qty = Number(item.quantity || 1);
       addedSubtotal += unitPrice * qty;
       await client.query(
@@ -1180,6 +1282,51 @@ router.post('/:id/items', authenticate, async (req, res) => {
          VALUES ($1,$2,$3,$4)`,
         [req.params.id, item.menu_item_id, qty, unitPrice]
       );
+
+      // ── Deduct ingredient stock for this added item ─────────────────────
+      // Bug fixed 2026-07-08: adding items to an existing order never moved
+      // stock — only the initial order creation did. SAVEPOINT so a missing
+      // BOM/warehouse row never aborts the whole add-items request.
+      try {
+        await client.query('SAVEPOINT ingredient_deduction_add');
+        const bom = await client.query(
+          `SELECT mii.ingredient_id, mii.quantity_used, i.cost_per_unit
+           FROM menu_item_ingredients mii
+           JOIN warehouse_items i ON mii.ingredient_id = i.id
+           WHERE mii.menu_item_id=$1`, [item.menu_item_id]
+        );
+        for (const ing of bom.rows) {
+          const qtyUsed = parseFloat(ing.quantity_used) * qty;
+          await client.query(
+            'UPDATE warehouse_items SET quantity_in_stock = GREATEST(0, quantity_in_stock - $1), updated_at=NOW() WHERE id=$2',
+            [qtyUsed, ing.ingredient_id]
+          );
+          const ingCost = parseFloat(ing.cost_per_unit || 0);
+          await client.query(
+            `INSERT INTO stock_movements (item_id, type, quantity, user_id, reason, cost_per_unit, restaurant_id)
+             VALUES ($1, 'OUT', $2, $3, $4, $5, $6)`,
+            [ing.ingredient_id, qtyUsed, req.user.id,
+             `Auto: Order #${orderNumForStock} (added item) — ${qty}x ${itemName}`,
+             ingCost, rid(req)]
+          );
+          addedIngredientCost += qtyUsed * ingCost;
+        }
+        await client.query('RELEASE SAVEPOINT ingredient_deduction_add');
+      } catch (ingErr) {
+        await client.query('ROLLBACK TO SAVEPOINT ingredient_deduction_add');
+        console.warn('Ingredient deduction skipped (add-items):', ingErr.message);
+      }
+    }
+
+    // Record ingredient cost as expense (safe — expenses table is optional)
+    if (addedIngredientCost > 0) {
+      try {
+        await client.query(
+          `INSERT INTO expenses (category, description, amount, expense_date, recorded_by, restaurant_id)
+           VALUES ('cost_of_goods', $1, $2, CURRENT_DATE, $3, $4)`,
+          [`Ingredients for items added to order #${orderNumForStock}`, addedIngredientCost, req.user.id, rid(req)]
+        );
+      } catch (_) { /* skip if expenses table not available */ }
     }
 
     // Recalculate total from all items
