@@ -520,7 +520,7 @@ router.get('/:id', authenticate, async (req, res) => {
 // order from the active-order modal). Authorization is still scoped per restaurant by
 // the `WHERE restaurant_id=...` filter below, and waitresses can't change role-restricted
 // fields (payment_method, cancellation, etc.) from their UI.
-router.put('/:id', authenticate, authorize('owner', 'admin', 'cashier', 'waitress'), async (req, res) => {
+router.put('/:id', authenticate, authorize('owner', 'admin', 'cashier', 'waitress', 'new_cashier', 'new_waiter'), async (req, res) => {
   const { table_id, waitress_id, guest_count, notes, items, payment_method } = req.body;
   const client = await db.connect();
   try {
