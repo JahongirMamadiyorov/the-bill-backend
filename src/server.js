@@ -22,7 +22,11 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // ── Static files ──────────────────────────────────────────────────────────────
-app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
+// maxAge so the POS/website don't re-download an unchanged menu photo on every
+// screen load — free speed win, no functional change (uploaded filenames are
+// already unique per upload, so a long cache lifetime can't ever serve stale
+// content for a changed photo).
+app.use('/uploads', express.static(path.join(__dirname, '../uploads'), { maxAge: '7d', etag: true }));
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 app.use('/api/auth',          require('./routes/auth'));
