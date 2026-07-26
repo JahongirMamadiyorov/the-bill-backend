@@ -91,6 +91,19 @@ const { broadcast }            = require('../utils/wsClients');
   } catch (_) {}
 })();
 
+// ── Auto-migration: refund columns ──────────────────────────────────────────
+// Refunds do NOT change orders.status (stays 'paid') — a separate refunded_at
+// flag avoids touching the orders_status_check CHECK constraint and any code
+// that branches on status. History screen shows "Refunded" whenever
+// refunded_at IS NOT NULL, "Completed" otherwise.
+;(async () => {
+  try {
+    await db.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS refunded_at TIMESTAMPTZ`);
+    await db.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS refund_reason TEXT`);
+    await db.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS refunded_by UUID REFERENCES users(id) ON DELETE SET NULL`);
+  } catch (_) {}
+})();
+
 // GET /api/orders
 router.get('/', authenticate, async (req, res) => {
   try {
@@ -1494,6 +1507,110 @@ router.put('/:id/loan/pay', authenticate, authorize('owner', 'admin', 'cashier')
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// POST /api/orders/:id/refund — full-order refund of a paid order.
+// Design handoff "History → Process Refund" (screenshots 08/09): reason is one
+// of Customer Complaint / Wrong Order / Duplicate Payment / Other. V1 is
+// whole-order only (no partial/line-item refunds yet).
+//
+// What it does, in one transaction:
+//   1. Restores ingredient stock for every order item via the same BOM lookup
+//      pattern used everywhere else in this file (SAVEPOINT per item so a
+//      missing BOM/warehouse row never aborts the refund) — logs type='IN'
+//      stock_movements with the same 'Auto: Order #<num> (refund) — ...'
+//      prefix convention so the Output tab picks it up (see AdminInventory.jsx
+//      isOrderRefund()).
+//   2. Reverses the cash_flow entry that PUT /:id/pay recorded for cash
+//      payments (logs a matching 'out' row — does not delete the original
+//      'in' row, so the ledger stays a full audit trail).
+//   3. If the order was paid via loan and the loan is still active, cancels
+//      the loan (sets status='paid' with a note) so the customer isn't billed
+//      for a refunded order — does NOT touch loans already collected.
+//   4. Sets refunded_at/refund_reason/refunded_by. Does NOT change `status`
+//      (stays 'paid') — see the refund-columns migration comment above.
+router.post('/:id/refund', authenticate, authorize('owner', 'admin', 'cashier', 'new_cashier'), async (req, res) => {
+  const { reason } = req.body;
+  if (!reason || !String(reason).trim()) return res.status(400).json({ error: 'Refund reason is required' });
+
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+
+    const existing = await client.query('SELECT * FROM orders WHERE id=$1 AND restaurant_id=$2', [req.params.id, rid(req)]);
+    if (!existing.rows[0]) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Order not found' }); }
+    const order = existing.rows[0];
+    if (order.status !== 'paid') { await client.query('ROLLBACK'); return res.status(400).json({ error: 'Only paid orders can be refunded' }); }
+    if (order.refunded_at)      { await client.query('ROLLBACK'); return res.status(400).json({ error: 'Order was already refunded' }); }
+
+    const orderNumForStock = order.daily_number || order.id.slice(0, 8);
+    const orderItems = await client.query('SELECT menu_item_id, quantity FROM order_items WHERE order_id=$1', [order.id]);
+
+    for (const item of orderItems.rows) {
+      if (!item.menu_item_id) continue;
+      try {
+        await client.query('SAVEPOINT refund_item_stock');
+        const nameRes = await client.query('SELECT name FROM menu_items WHERE id=$1 AND restaurant_id=$2', [item.menu_item_id, rid(req)]);
+        const itemName = nameRes.rows[0]?.name || item.menu_item_id;
+        const bom = await client.query(
+          `SELECT mii.ingredient_id, mii.quantity_used, i.cost_per_unit
+           FROM menu_item_ingredients mii
+           JOIN warehouse_items i ON mii.ingredient_id = i.id
+           WHERE mii.menu_item_id=$1`, [item.menu_item_id]
+        );
+        for (const ing of bom.rows) {
+          const qty  = parseFloat(ing.quantity_used) * parseFloat(item.quantity);
+          const cost = parseFloat(ing.cost_per_unit || 0);
+          await client.query(
+            'UPDATE warehouse_items SET quantity_in_stock = quantity_in_stock + $1, updated_at=NOW() WHERE id=$2',
+            [qty, ing.ingredient_id]
+          );
+          await client.query(
+            `INSERT INTO stock_movements (item_id, type, quantity, user_id, reason, cost_per_unit, restaurant_id)
+             VALUES ($1, 'IN', $2, $3, $4, $5, $6)`,
+            [ing.ingredient_id, qty, req.user.id,
+             `Auto: Order #${orderNumForStock} (refund) — ${item.quantity}x ${itemName}`,
+             cost, rid(req)]
+          );
+        }
+        await client.query('RELEASE SAVEPOINT refund_item_stock');
+      } catch (stockErr) {
+        await client.query('ROLLBACK TO SAVEPOINT refund_item_stock');
+        console.warn('Refund stock restore skipped for item:', item.menu_item_id, stockErr.message);
+      }
+    }
+
+    // Reverse cash inflow (mirrors PUT /:id/pay's cash_flow 'in' entry)
+    if (order.payment_method === 'cash') {
+      await client.query(
+        `INSERT INTO cash_flow (type, amount, description, recorded_by, restaurant_id)
+         VALUES ('out', $1, $2, $3, $4)`,
+        [order.total_amount, `Refund for order #${orderNumForStock} (${reason})`, req.user.id, rid(req)]
+      );
+    }
+
+    // Cancel an outstanding loan tied to this order, if any (don't touch already-paid loans)
+    try {
+      await client.query(
+        `UPDATE loans SET status='paid', paid_at=NOW(), notes=COALESCE(notes,'') || ' [Cancelled: order refunded]', updated_at=NOW()
+         WHERE order_id=$1 AND restaurant_id=$2 AND status='active'`,
+        [order.id, rid(req)]
+      );
+    } catch (_) { /* loans table optional */ }
+
+    const result = await client.query(
+      `UPDATE orders SET refunded_at=NOW(), refund_reason=$1, refunded_by=$2, updated_at=NOW()
+       WHERE id=$3 RETURNING *`,
+      [reason, req.user.id, order.id]
+    );
+
+    await client.query('COMMIT');
+    res.json(result.rows[0]);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('POST /orders/:id/refund error:', err.message);
+    res.status(500).json({ error: err.message });
+  } finally { client.release(); }
 });
 
 module.exports = router;

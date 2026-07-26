@@ -3,7 +3,9 @@ const router   = express.Router();
 const db       = require('../config/db');
 const { authenticate, authorize, rid } = require('../middleware/auth');
 
-const ALLOWED_ROLES = ['admin', 'owner', 'super_admin', 'cashier'];
+// new_cashier / new_waiter are the POS-app roles (pos-app reads currency symbol,
+// tax and service-charge settings at startup) — without them here the POS gets 403.
+const ALLOWED_ROLES = ['admin', 'owner', 'super_admin', 'cashier', 'new_cashier', 'new_waiter'];
 
 // ── GET /api/settings ─────────────────────────────────────────────────────────
 router.get('/', authenticate, authorize(...ALLOWED_ROLES), async (req, res) => {
