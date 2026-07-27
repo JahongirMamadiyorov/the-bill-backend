@@ -10,6 +10,22 @@ require('dotenv').config();
 
 const app = express();
 
+// Render (and most PaaS hosts) terminate TLS at their own edge proxy and talk
+// to this process over plain HTTP internally, forwarding the real scheme via
+// `X-Forwarded-Proto: https`. Express ignores that header by default, so
+// `req.protocol` reports 'http' even for a request that arrived over HTTPS —
+// this is the confirmed root cause of menu.js's `POST /menu/upload` building
+// `fullUrl` as `http://the-bill-backend-pego.onrender.com/uploads/menu/...`
+// instead of `https://...`, which then gets blocked by pos-app's Admin panel
+// CSP (`img-src ... https://the-bill-backend-pego.onrender.com` — https only,
+// on purpose) and would also silently trip browsers' mixed-content blocking
+// on the website itself. `trust proxy` makes Express honor the forwarded
+// header, so every fullUrl built from here on is correctly https://.
+// Existing rows already saved with an http:// image_url are NOT retroactively
+// fixed by this — see the client-side upgrade in pos-app's MenuScreen.jsx
+// (resolveImgUrl) for the fix covering already-stored bad URLs.
+app.set('trust proxy', 1);
+
 // All schema changes are consolidated in src/config/schema.sql.
 // Historical migration files have been archived to src/config/migrations_archive/.
 
