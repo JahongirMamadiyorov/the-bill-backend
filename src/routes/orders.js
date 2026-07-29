@@ -748,7 +748,15 @@ router.put('/:id', authenticate, authorize('owner', 'admin', 'cashier', 'waitres
 
 // POST /api/orders — create new order
 router.post('/', authenticate, async (req, res) => {
-  const { table_id, items, notes, order_type = 'dine_in', customer_name, customer_phone, delivery_address, guest_count } = req.body;
+  const { table_id, items, notes, order_type = 'dine_in', customer_name, customer_phone, delivery_address, guest_count,
+          // `client_prints_locally`: set by pos-app terminals only (Electron — Cashier/Admin).
+          // pos-app opens its own direct LAN-TCP connection to the kitchen printer the
+          // instant this request succeeds (see pos-app/main.js's print engine), so this
+          // route must NOT also broadcast/attempt a print for the same order — that would
+          // print every pos-app ticket twice. The website and the phone app (RestaurantApp)
+          // never send this flag, so their orders keep triggering the broadcast below
+          // exactly as before, which the print-agent relay still picks up unchanged.
+          client_prints_locally } = req.body;
   const client = await db.connect();
   try {
     await client.query('BEGIN');
@@ -898,10 +906,13 @@ router.post('/', authenticate, async (req, res) => {
         const tableRes = await db.query('SELECT name, table_number FROM restaurant_tables WHERE id=$1', [table_id || '00000000-0000-0000-0000-000000000000']);
         const tableRow  = tableRes.rows[0];
         const printOrder = { ...order, table_number: tableRow?.table_number ?? null, table_name: tableRow?.name ?? null };
-        // Push to cashier panel WebSocket (real-time LAN print)
-        broadcast(rid(req), { type: 'kitchen_print', order: printOrder, items: orderItemsRes.rows });
-        // Also attempt direct TCP from Render (no-op when printer is on LAN only)
-        await sendKitchenPrintJobs({ db, restaurantId: rid(req), order: printOrder, items: orderItemsRes.rows });
+        if (!client_prints_locally) {
+          // Push to cashier panel WebSocket (real-time LAN print) — website + phone app only,
+          // skipped for pos-app terminals since they print directly themselves (see above).
+          broadcast(rid(req), { type: 'kitchen_print', order: printOrder, items: orderItemsRes.rows });
+          // Also attempt direct TCP from Render (no-op when printer is on LAN only)
+          await sendKitchenPrintJobs({ db, restaurantId: rid(req), order: printOrder, items: orderItemsRes.rows });
+        }
       } catch (e) { console.warn('[kitchenPrint] post-order error:', e.message); }
     })();
 
@@ -1263,7 +1274,8 @@ router.delete('/:id', authenticate, authorize('owner', 'admin'), async (req, res
 // POST /api/orders/:id/items — waitress appends new items to an existing order
 // Does NOT replace existing items — only adds new ones and recalculates the total.
 router.post('/:id/items', authenticate, async (req, res) => {
-  const { items } = req.body;
+  // See POST '/' above for why `client_prints_locally` exists and how it's used.
+  const { items, client_prints_locally } = req.body;
   if (!Array.isArray(items) || items.length === 0)
     return res.status(400).json({ error: 'items array required' });
 
@@ -1425,10 +1437,12 @@ router.post('/:id/items', authenticate, async (req, res) => {
           addTableName = addTableRes.rows[0]?.name ?? null;
         }
         const addOrder = { ...addOrderRow, table_number: addOrderRow?.table_number ?? null, table_name: addTableName };
-        // Push to cashier panel WebSocket (real-time LAN print)
-        broadcast(rid(req), { type: 'kitchen_print', order: addOrder, items: newItemsRes.rows });
-        // Also attempt direct TCP from Render (no-op when printer is on LAN only)
-        await sendKitchenPrintJobs({ db, restaurantId: rid(req), order: addOrder, items: newItemsRes.rows });
+        if (!client_prints_locally) {
+          // Push to cashier panel WebSocket (real-time LAN print) — website + phone app only.
+          broadcast(rid(req), { type: 'kitchen_print', order: addOrder, items: newItemsRes.rows });
+          // Also attempt direct TCP from Render (no-op when printer is on LAN only)
+          await sendKitchenPrintJobs({ db, restaurantId: rid(req), order: addOrder, items: newItemsRes.rows });
+        }
       } catch (e) { console.warn('[kitchenPrint] add-items print error:', e.message); }
     })();
 
