@@ -60,6 +60,11 @@ router.put('/', authenticate, authorize(...ALLOWED_ROLES), async (req, res) => {
       receipt_show_footer,
       receipt_show_order_number,
       receipt_show_table_name,
+      // Auto-print the customer receipt when payment succeeds (pos-app only).
+      // Added 2026-08-02. This route is an explicit whitelist — a new column must be
+      // added in FOUR places (this destructure, the INSERT column list, the ON CONFLICT
+      // update, and the values array) or it silently never persists.
+      receipt_auto_print,
       // Kitchen toggles
       kitchen_show_table_name,
       kitchen_show_order_number,
@@ -82,11 +87,12 @@ router.put('/', authenticate, authorize(...ALLOWED_ROLES), async (req, res) => {
          kitchen_show_table_name, kitchen_show_order_number, kitchen_show_customer_name,
          kitchen_show_notes, kitchen_show_timestamp,
          kitchen_show_order_type, kitchen_show_item_price, kitchen_show_qty_unit,
+         receipt_auto_print,
          updated_at
        ) VALUES (
          $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
          $13::jsonb, $14::jsonb,
-         $15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,now()
+         $15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,now()
        )
        ON CONFLICT (restaurant_id) DO UPDATE SET
          restaurant_name         = EXCLUDED.restaurant_name,
@@ -116,6 +122,7 @@ router.put('/', authenticate, authorize(...ALLOWED_ROLES), async (req, res) => {
          kitchen_show_order_type      = EXCLUDED.kitchen_show_order_type,
          kitchen_show_item_price      = EXCLUDED.kitchen_show_item_price,
          kitchen_show_qty_unit        = EXCLUDED.kitchen_show_qty_unit,
+         receipt_auto_print           = EXCLUDED.receipt_auto_print,
          updated_at              = now()
        RETURNING *`,
       [
@@ -147,6 +154,8 @@ router.put('/', authenticate, authorize(...ALLOWED_ROLES), async (req, res) => {
         kitchen_show_order_type      ?? true,
         kitchen_show_item_price      ?? false,
         kitchen_show_qty_unit        ?? true,
+        // Defaults TRUE, matching the website's PayModal which always printed on payment.
+        receipt_auto_print           ?? true,
       ]
     );
 
