@@ -5,6 +5,92 @@ const { authenticate, authorize, rid } = require('../middleware/auth');
 const { sendKitchenPrintJobs } = require('../utils/kitchenPrint');
 const { broadcast }            = require('../utils/wsClients');
 
+// ═══════════════════════════════════════════════════════════════════════════
+// ORDER AUDIT LOG ("lock history") — added 2026-08-09.
+// Records who changed what on an order and exactly when, so a manager can open
+// order #14 in the Admin panel and see its whole life, including after it closes.
+//
+// `action` is a CODE and `details` is structured JSON — never a prewritten
+// sentence — because the Admin panel renders these in Uzbek or English at
+// display time. Adding a new action means adding one translation, not a
+// migration.
+//
+// FIRE-AND-FORGET BY DESIGN: logging must never break, slow or roll back the
+// operation it is recording. Every call is awaited but fully swallowed on error;
+// a failed log line is vastly preferable to a failed payment. This also means
+// logging runs OUTSIDE the caller's transaction, so a rolled-back operation
+// leaves no misleading entry.
+// ═══════════════════════════════════════════════════════════════════════════
+// Owner's choice: "1 month and 2 weeks" = 6 weeks = 45 days (2026-08-09,
+// raised from an initial 14 days). Change this one constant to adjust it —
+// the sweep below picks it up with no migration.
+const AUDIT_RETENTION_DAYS = 45;
+
+async function logOrderChange(req, { orderId, orderNumber, action, details }) {
+  if (!orderId || !action) return;
+  try {
+    await db.query(
+      `INSERT INTO order_audit_log
+         (restaurant_id, order_id, order_number, user_id, user_name, user_role, action, details)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb)`,
+      [
+        rid(req),
+        orderId,
+        orderNumber ?? null,
+        req.user?.id   ?? null,
+        req.user?.name ?? null,   // denormalised so history survives staff deletion
+        req.user?.role ?? null,
+        action,
+        JSON.stringify(details || {}),
+      ]
+    );
+
+    // Retention sweep, run opportunistically (~1 in 50 writes) rather than on a
+    // schedule — pg_cron isn't installed on this project, and a separate cron
+    // job is one more thing that can silently stop working. Cheap: the
+    // created_at index makes this a range delete.
+    if (Math.random() < 0.02) {
+      await db.query(
+        `DELETE FROM order_audit_log WHERE created_at < now() - ($1 || ' days')::interval`,
+        [String(AUDIT_RETENTION_DAYS)]
+      );
+    }
+  } catch (err) {
+    console.warn('[audit] failed to log order change:', err.message);
+  }
+}
+
+// Turns "before" and "after" item lists into add/remove/change entries.
+// Used by the edit path, which DELETEs and re-INSERTs every row and therefore
+// cannot say what actually changed without a diff.
+function diffOrderItems(before, after) {
+  const key = (r) => String(r.menu_item_id ?? r.menuItemId ?? '');
+  const sum = (rows) => {
+    const m = new Map();
+    for (const r of rows || []) {
+      const k = key(r);
+      if (!k) continue;
+      const prev = m.get(k) || { qty: 0, name: r.name || null, price: Number(r.unit_price ?? r.unitPrice ?? 0) };
+      prev.qty += Number(r.quantity ?? r.qty ?? 0) || 0;
+      if (!prev.name && r.name) prev.name = r.name;
+      m.set(k, prev);
+    }
+    return m;
+  };
+
+  const a = sum(before), b = sum(after);
+  const changes = [];
+  for (const [k, bv] of b) {
+    const av = a.get(k);
+    if (!av)                    changes.push({ action: 'item_added',   details: { item: bv.name, quantity: bv.qty, price: bv.price } });
+    else if (av.qty !== bv.qty) changes.push({ action: 'item_qty_changed', details: { item: bv.name || av.name, from: av.qty, to: bv.qty } });
+  }
+  for (const [k, av] of a) {
+    if (!b.has(k))              changes.push({ action: 'item_removed', details: { item: av.name, quantity: av.qty } });
+  }
+  return changes;
+}
+
 // ── Auto-migration: item_ready per-item readiness tracking ────────────────────
 ;(async () => {
   try {
@@ -538,6 +624,20 @@ router.put('/:id', authenticate, authorize('owner', 'admin', 'cashier', 'waitres
       return res.status(404).json({ error: 'Order not found' });
     }
 
+    // AUDIT: snapshot the items BEFORE they're wiped. This route deletes every
+    // order_item and re-inserts, so without capturing here there is no way to
+    // report what was actually added, removed or changed. Captured with names
+    // joined in, because menu items can be renamed or deleted later and the
+    // history must still read correctly. Kept separate from the stock-diff read
+    // below on purpose — that one lives in a try/catch that can be skipped.
+    let auditBeforeItems = [];
+    try {
+      auditBeforeItems = (await client.query(
+        `SELECT oi.menu_item_id, oi.quantity, oi.unit_price, m.name
+           FROM order_items oi LEFT JOIN menu_items m ON m.id = oi.menu_item_id
+          WHERE oi.order_id = $1`, [req.params.id])).rows;
+    } catch (_) { /* audit must never break the edit */ }
+
     // Build dynamic SET clause
     const sets = ['updated_at=NOW()'];
     const vals = [];
@@ -731,6 +831,42 @@ router.put('/:id', authenticate, authorize('owner', 'admin', 'cashier', 'waitres
 
     await client.query('COMMIT');
 
+    // AUDIT: what actually changed on this edit (see diffOrderItems).
+    if (Array.isArray(items)) {
+      // Resolve names for items that were NOT in the before-snapshot — a newly
+      // added product has no name there, and "added null" is a useless log line.
+      let newNameMap = {};
+      try {
+        const ids = [...new Set(items.map((i) => i.menu_item_id).filter(Boolean))];
+        if (ids.length) {
+          const rows = (await db.query('SELECT id, name FROM menu_items WHERE id = ANY($1)', [ids])).rows;
+          newNameMap = Object.fromEntries(rows.map((r) => [r.id, r.name]));
+        }
+      } catch (_) { /* audit never breaks the edit */ }
+
+      const afterRows = items.map((it) => ({
+        menu_item_id: it.menu_item_id,
+        quantity: it.quantity,
+        unit_price: it.unit_price,
+        name: newNameMap[it.menu_item_id] || null,
+      }));
+      for (const c of diffOrderItems(auditBeforeItems, afterRows)) {
+        await logOrderChange(req, {
+          orderId: req.params.id,
+          orderNumber: existing.rows[0].daily_number,
+          action: c.action,
+          details: c.details,
+        });
+      }
+    }
+    if (table_id !== undefined && table_id !== existing.rows[0].table_id) {
+      await logOrderChange(req, {
+        orderId: req.params.id, orderNumber: existing.rows[0].daily_number,
+        action: 'table_changed',
+        details: { from: existing.rows[0].table_id, to: table_id },
+      });
+    }
+
     // Return fresh order + items
     const updatedOrder = await db.query(
       `SELECT o.*, t.table_number, t.name as table_name, u.name as waitress_name
@@ -923,6 +1059,17 @@ router.post('/', authenticate, async (req, res) => {
       } catch (e) { console.warn('[kitchenPrint] post-order error:', e.message); }
     })();
 
+    // AUDIT: order created, with the opening item list.
+    await logOrderChange(req, {
+      orderId: order.id, orderNumber: order.daily_number, action: 'order_created',
+      details: {
+        orderType: order_type,
+        items: (items || []).map((i) => ({
+          item: menuNameMap[i.menu_item_id] || null, quantity: i.quantity,
+        })),
+      },
+    });
+
     res.status(201).json(order);
   } catch (err) {
     await client.query('ROLLBACK');
@@ -1023,6 +1170,13 @@ router.put('/:id/status', authenticate, async (req, res) => {
       }
     }
     await client.query('COMMIT');
+
+    // AUDIT: status transition (this route is also how an order gets cancelled).
+    await logOrderChange(req, {
+      orderId: order.id, orderNumber: order.daily_number,
+      action: status === 'cancelled' ? 'order_cancelled' : 'status_changed',
+      details: { from: order.status, to: status },
+    });
 
     // Notify waitress if order is ready
     if (status === 'ready' && order.waitress_id) {
@@ -1262,6 +1416,17 @@ router.put('/:id/pay', authenticate, async (req, res) => {
     // ── End ingredient deduction ─────────────────────────────────────────────
 
     await client.query('COMMIT');
+
+    // AUDIT: payment taken.
+    await logOrderChange(req, {
+      orderId: order.id, orderNumber: order.daily_number, action: 'paid',
+      details: {
+        method: req.body?.paymentMethod || req.body?.payment_method || null,
+        amount: order.total_amount,
+        discount: req.body?.discountAmount ?? req.body?.discount_amount ?? 0,
+      },
+    });
+
     res.json(order);
   } catch (err) {
     await client.query('ROLLBACK');
@@ -1274,6 +1439,12 @@ router.delete('/:id', authenticate, authorize('owner', 'admin'), async (req, res
   try {
     const result = await db.query(`UPDATE orders SET status='cancelled', updated_at=NOW() WHERE id=$1 AND restaurant_id=$2 RETURNING id`, [req.params.id, rid(req)]);
     if (!result.rows[0]) return res.status(404).json({ error: 'Order not found' });
+    // AUDIT: deletion. Logged deliberately AFTER the row is gone — the audit
+    // table has no FK to orders precisely so this evidence survives.
+    await logOrderChange(req, {
+      orderId: req.params.id, orderNumber: null, action: 'order_deleted', details: {},
+    });
+
     res.json({ message: 'Order cancelled' });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -1393,6 +1564,25 @@ router.post('/:id/items', authenticate, async (req, res) => {
     );
 
     await client.query('COMMIT');
+
+    // AUDIT: items appended to an existing order. Names resolved from menu_items
+    // so the entry stays readable if the product is later renamed or removed.
+    try {
+      const added = Array.isArray(items) ? items : [];
+      if (added.length) {
+        const ids = [...new Set(added.map((i) => i.menu_item_id).filter(Boolean))];
+        const nameRows = ids.length
+          ? (await db.query('SELECT id, name FROM menu_items WHERE id = ANY($1)', [ids])).rows : [];
+        const nameMap = Object.fromEntries(nameRows.map((r) => [r.id, r.name]));
+        const dn = (await db.query('SELECT daily_number FROM orders WHERE id=$1', [req.params.id])).rows[0]?.daily_number;
+        for (const it of added) {
+          await logOrderChange(req, {
+            orderId: req.params.id, orderNumber: dn, action: 'item_added',
+            details: { item: nameMap[it.menu_item_id] || null, quantity: it.quantity },
+          });
+        }
+      }
+    } catch (_) { /* audit never breaks the write */ }
 
     // Return updated order + all items
     const updatedOrder = await db.query(
@@ -1626,12 +1816,45 @@ router.post('/:id/refund', authenticate, authorize('owner', 'admin', 'cashier', 
     );
 
     await client.query('COMMIT');
+
+    // AUDIT: refund — one of the most important things a manager reviews.
+    await logOrderChange(req, {
+      orderId: order.id, orderNumber: order.daily_number, action: 'refunded',
+      details: { reason: reason || null, amount: order.total_amount },
+    });
+
     res.json(result.rows[0]);
   } catch (err) {
     await client.query('ROLLBACK');
     console.error('POST /orders/:id/refund error:', err.message);
     res.status(500).json({ error: err.message });
   } finally { client.release(); }
+});
+
+// GET /api/orders/:id/history — the order's change log ("lock history").
+//
+// Restricted to owner/admin by explicit decision (2026-08-09): this is a
+// management tool, and staff seeing who changed what invites blame arguments on
+// the floor. Owner is included because it is the account ABOVE admin — locking
+// the owner out of an audit log for their own restaurant would make no sense.
+//
+// Scoped by restaurant_id like everything else, so one venue can never read
+// another's history. Works for CLOSED and even DELETED orders — the audit table
+// deliberately has no foreign key to `orders`.
+router.get('/:id/history', authenticate, authorize('owner', 'admin'), async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT id, order_id, order_number, user_id, user_name, user_role,
+              action, details, created_at
+         FROM order_audit_log
+        WHERE order_id = $1 AND restaurant_id = $2
+        ORDER BY created_at DESC, id DESC`,
+      [req.params.id, rid(req)]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 module.exports = router;
