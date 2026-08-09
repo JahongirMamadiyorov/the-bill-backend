@@ -172,7 +172,8 @@ router.get('/', authenticate, async (req, res) => {
                 COALESCE(m.unit, 'piece') AS unit
          FROM order_items oi
          LEFT JOIN menu_items m ON oi.menu_item_id = m.id
-         WHERE oi.order_id = ANY($1::uuid[])`,
+         WHERE oi.order_id = ANY($1::uuid[])
+         ORDER BY oi.created_at ASC, oi.id ASC`,
         [ids]
       );
       const itemMap = {};
@@ -256,6 +257,7 @@ router.get('/kitchen', authenticate, authorize('owner', 'admin', 'kitchen'), asy
          FROM order_items oi
          LEFT JOIN menu_items m ON oi.menu_item_id = m.id
          WHERE oi.order_id = ANY($1::uuid[])
+         ORDER BY oi.created_at ASC, oi.id ASC
            AND (m.kitchen_station = $2 OR m.kitchen_station IS NULL)`,
         [orderIds, userStation]
       );
@@ -265,7 +267,8 @@ router.get('/kitchen', authenticate, authorize('owner', 'admin', 'kitchen'), asy
         `SELECT oi.*, COALESCE(m.name, 'Unknown item') as name, COALESCE(m.name, 'Unknown item') as item_name, COALESCE(m.unit, 'piece') AS unit, m.kitchen_station, oi.item_ready, COALESCE(m.unit, 'piece') AS unit
          FROM order_items oi
          LEFT JOIN menu_items m ON oi.menu_item_id = m.id
-         WHERE oi.order_id = ANY($1::uuid[])`,
+         WHERE oi.order_id = ANY($1::uuid[])
+         ORDER BY oi.created_at ASC, oi.id ASC`,
         [orderIds]
       );
     }
@@ -373,7 +376,8 @@ router.get('/kitchen/completed', authenticate, authorize('owner', 'admin', 'kitc
       `SELECT oi.*, m.name as item_name, m.kitchen_station, COALESCE(m.unit, 'piece') AS unit
        FROM order_items oi
        LEFT JOIN menu_items m ON oi.menu_item_id = m.id
-       WHERE oi.order_id = ANY($1::uuid[])`,
+       WHERE oi.order_id = ANY($1::uuid[])
+       ORDER BY oi.created_at ASC, oi.id ASC`,
       [orderIds]
     );
 
@@ -499,7 +503,8 @@ router.get('/:id', authenticate, async (req, res) => {
     const items = await db.query(
       `SELECT oi.*, COALESCE(m.name, 'Unknown item') as name, COALESCE(m.name, 'Unknown item') as item_name, COALESCE(m.unit, 'piece') AS unit
        FROM order_items oi LEFT JOIN menu_items m ON oi.menu_item_id=m.id AND m.restaurant_id = (SELECT restaurant_id FROM orders WHERE id=$2)
-       WHERE oi.order_id=$1`, [req.params.id, req.params.id]
+       WHERE oi.order_id=$1
+       ORDER BY oi.created_at ASC, oi.id ASC`, [req.params.id, req.params.id]
     );
     // Fetch loan details if payment method is loan
     let loanData = null;
@@ -737,7 +742,8 @@ router.put('/:id', authenticate, authorize('owner', 'admin', 'cashier', 'waitres
     const updatedItems = await db.query(
       `SELECT oi.*, COALESCE(m.name, 'Unknown item') as name, COALESCE(m.name, 'Unknown item') as item_name, COALESCE(m.unit, 'piece') AS unit
        FROM order_items oi LEFT JOIN menu_items m ON oi.menu_item_id=m.id AND m.restaurant_id = (SELECT restaurant_id FROM orders WHERE id=$2)
-       WHERE oi.order_id=$1`, [req.params.id, req.params.id]
+       WHERE oi.order_id=$1
+       ORDER BY oi.created_at ASC, oi.id ASC`, [req.params.id, req.params.id]
     );
     res.json({ ...updatedOrder.rows[0], items: updatedItems.rows });
   } catch (err) {
@@ -900,7 +906,8 @@ router.post('/', authenticate, async (req, res) => {
           `SELECT oi.menu_item_id, oi.quantity, oi.notes, m.kitchen_station, m.name, m.unit
            FROM order_items oi
            LEFT JOIN menu_items m ON oi.menu_item_id = m.id
-           WHERE oi.order_id = $1`,
+           WHERE oi.order_id = $1
+           ORDER BY oi.created_at ASC, oi.id ASC`,
           [order.id]
         );
         const tableRes = await db.query('SELECT name, table_number FROM restaurant_tables WHERE id=$1', [table_id || '00000000-0000-0000-0000-000000000000']);
