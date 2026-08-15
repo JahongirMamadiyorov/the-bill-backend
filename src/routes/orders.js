@@ -617,11 +617,70 @@ router.put('/:id', authenticate, authorize('owner', 'admin', 'cashier', 'waitres
   try {
     await client.query('BEGIN');
 
-    // Verify order exists and belongs to this restaurant
-    const existing = await client.query('SELECT * FROM orders WHERE id=$1 AND restaurant_id=$2', [req.params.id, rid(req)]);
+    // Verify order exists and belongs to this restaurant.
+    //
+    // ── FOR UPDATE IS LOAD-BEARING (added 2026-08-15) — DO NOT REMOVE ────────
+    // This route replaces the item list wholesale: DELETE every order_item, then
+    // re-INSERT what the client sent. Under READ COMMITTED (Postgres' default)
+    // two overlapping saves of the SAME order corrupt it:
+    //
+    //   request A: BEGIN, DELETE (removes the rows it can see), INSERT 16 rows
+    //   request B: BEGIN, DELETE — A has not COMMITted, so B cannot see A's rows
+    //              and deletes nothing — INSERT 17 rows
+    //   both COMMIT  →  33 rows on an order that should have 17
+    //
+    // Not hypothetical. Order #9 at restaurant a0000000-...-0001 on 2026-08-13
+    // holds exactly that: 16 rows written at 16:37:04.645 and 17 at 16:37:06.324
+    // (the same list plus one Cola) — 33 rows worth 1,098,000 against a charged
+    // total_amount of 558,000. Reported by the owner as "more items appear
+    // inside the order than what was there".
+    //
+    // Locking the ORDER row makes every mutation of a given order queue behind
+    // the previous one, so B's DELETE runs after A commits and removes A's rows.
+    // Two cashiers saving at once, a double-tapped Save, and a client retry after
+    // a slow response are all serialised instead of racing. One row, one table,
+    // taken at the very start of the transaction, so it cannot deadlock against
+    // itself. The same lock is now on POST /:id/items and POST /:id/refund.
+    const existing = await client.query('SELECT * FROM orders WHERE id=$1 AND restaurant_id=$2 FOR UPDATE', [req.params.id, rid(req)]);
     if (!existing.rows[0]) {
       await client.query('ROLLBACK');
       return res.status(404).json({ error: 'Order not found' });
+    }
+
+    // ── POST-PAYMENT EDIT DEFENCE (added 2026-08-15, owner-approved) ─────────
+    // A CLOSED order's item list is a financial record: total_amount was fixed
+    // at payment, cash_flow was written from it, and stock was deducted against
+    // it. Editing the items afterwards silently desynchronises all three — the
+    // order ends up describing food the takings never covered.
+    //
+    // This is exactly how order #9 was corrupted on 2026-08-13: cashier ea0ee2e7
+    // paid 540,000 at 16:37:11 and waiter c0632b75 changed Cola 1.5l from 1 to 2
+    // at 16:37:12 — 1.2 seconds later, from a phone. The edit rewrote the item
+    // list around the completed payment and left the order holding 558,000 of
+    // food against 540,000 collected.
+    //
+    // The row lock above stops the two writes from INTERLEAVING, but a lock
+    // cannot say "this order is finished" — without this check the waiter's edit
+    // would simply queue up and be applied cleanly a moment after payment, which
+    // is the same corruption arriving in an orderly fashion.
+    //
+    // 409 Conflict, not 403: the request is well-formed and the caller is
+    // authorised — it conflicts with the order's state. The message names the
+    // status so the POS can show the cashier something true rather than a
+    // generic failure.
+    //
+    // ESCAPE HATCH: to correct a genuinely wrong closed order, refund it and
+    // re-enter it. That leaves a trail; a silent edit does not. If restaurants
+    // turn out to need in-place correction of a paid order, gate it behind
+    // owner/admin AND log it as its own audit action — do not just delete this.
+    const CLOSED_STATUSES = ['paid', 'refunded', 'cancelled'];
+    if (CLOSED_STATUSES.includes(existing.rows[0].status)) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error:  `This order is ${existing.rows[0].status} and can no longer be edited.`,
+        status: existing.rows[0].status,
+        code:   'ORDER_CLOSED',
+      });
     }
 
     // AUDIT: snapshot the items BEFORE they're wiped. This route deletes every
@@ -1253,6 +1312,68 @@ router.put('/:id/pay', authenticate, async (req, res) => {
   try {
     await client.query('BEGIN');
 
+    // ── Serialize against concurrent edits (added 2026-08-15) ───────────────
+    // Taking the order's row lock HERE, before anything is computed, makes
+    // paying and editing mutually exclusive. Without it the two interleave:
+    // on 2026-08-13 order #9 was paid for 540,000 by the cashier at 16:37:11
+    // while a waiter changed Cola 1.5l from 1 to 2 on his phone 1.2 seconds
+    // later. The edit's own PUT rewrote the item list around the payment, and
+    // the order ended up charged 540,000 but holding 558,000 of items across
+    // 33 rows. See the long note on PUT /:id for the mechanism.
+    //
+    // The UPDATE below does lock the row, but only when it finally runs, which
+    // is far too late — every decision has been made by then.
+    const lock = await client.query(
+      'SELECT status FROM orders WHERE id=$1 AND restaurant_id=$2 FOR UPDATE',
+      [req.params.id, rid(req)]
+    );
+    if (!lock.rows[0]) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Order not found' });
+    }
+    // ── DOUBLE-PAYMENT DEFENCE (added 2026-08-15, owner-approved) ───────────
+    // This route had no already-paid guard, so a second submission re-ran the
+    // whole thing and wrote a SECOND cash_flow row. It happened 7 times in live
+    // data — every one recording exactly 2x the order total, 1,682,475 so'm of
+    // takings that were never collected:
+    //   #3 d50c2df5 544,500 · #2 e223b96e 529,000 · #14 d7fae8f1 272,975
+    //   #4 a2b1722d 177,000 · #16 f729e9ad  81,000 · #7  313cdde0  49,000
+    //   #8 5f381c7d  29,000
+    // Five pairs were 1-20s apart (double-tapped Pay, or a client retry after
+    // Render was slow). One was 1,787s — nearly 30 MINUTES — so this is not only
+    // a double-tap and the row lock above does NOT close it. Only this does.
+    //
+    // ── Why this ABSORBS the duplicate instead of returning an error ─────────
+    // Rejecting with 4xx would be the obvious move and is the WRONG one here.
+    // The dangerous case is the retry: the first payment succeeded but the
+    // response was lost, so the cashier sees a failure. If the retry also shows
+    // an error they will assume no payment was taken and collect the cash AGAIN
+    // — turning a harmless duplicate row into a real customer being charged
+    // twice. So a repeat payment on an already-paid order reports SUCCESS with
+    // the order as it stands, writes no money rows, and flags itself for the
+    // audit trail. Idempotent: same request, same answer, one set of effects.
+    //
+    // A REFUNDED order is deliberately still payable — refund-then-repay is a
+    // legitimate correction flow. Only 'paid' is absorbed.
+    if (lock.rows[0].status === 'paid') {
+      const already = await client.query(
+        `SELECT * FROM orders WHERE id=$1 AND restaurant_id=$2`,
+        [req.params.id, rid(req)]
+      );
+      await client.query('COMMIT');
+      try {
+        await logOrderChange(req.params.id, 'duplicate_payment_ignored', req.user.id, rid(req), {
+          attemptedMethod: payment_method,
+          paidAt:          already.rows[0]?.paid_at || null,
+        });
+      } catch { /* audit is best-effort — never fail a payment response over it */ }
+      return res.json({
+        ...already.rows[0],
+        alreadyPaid: true,
+        message: 'This order was already paid — the duplicate payment was ignored, no money was recorded twice.',
+      });
+    }
+
     // Ensure loans table exists before attempting insert
     await client.query(`
       CREATE TABLE IF NOT EXISTS loans (
@@ -1462,7 +1583,7 @@ router.post('/:id/items', authenticate, async (req, res) => {
     await client.query('BEGIN');
 
     // Verify order exists and belongs to this restaurant
-    const existing = await client.query('SELECT * FROM orders WHERE id=$1 AND restaurant_id=$2', [req.params.id, rid(req)]);
+    const existing = await client.query('SELECT * FROM orders WHERE id=$1 AND restaurant_id=$2 FOR UPDATE', [req.params.id, rid(req)]);
     if (!existing.rows[0]) {
       await client.query('ROLLBACK');
       return res.status(404).json({ error: 'Order not found' });
@@ -1470,9 +1591,21 @@ router.post('/:id/items', authenticate, async (req, res) => {
     const order = existing.rows[0];
     // Adding items is blocked only for finalised orders — bill_requested is allowed
     // (the cashier/waitress may still add items after the customer has asked for the bill).
-    if (order.status === 'paid' || order.status === 'cancelled') {
+    //
+    // 2026-08-15: 'refunded' added — it was missing, so a refunded order could
+    // still take new items, which is the same financial desync as adding to a
+    // paid one (the refund was calculated against a list that then changed).
+    // Response aligned with PUT /:id's new guard: 409 + code ORDER_CLOSED, so
+    // the POS and the phone app can handle "this order is finished" in ONE place
+    // instead of matching on message text per route. See the long note on
+    // PUT /:id for why closed orders are immutable.
+    if (['paid', 'refunded', 'cancelled'].includes(order.status)) {
       await client.query('ROLLBACK');
-      return res.status(400).json({ error: `Cannot add items to an order with status: ${order.status}` });
+      return res.status(409).json({
+        error:  `Cannot add items to an order with status: ${order.status}`,
+        status: order.status,
+        code:   'ORDER_CLOSED',
+      });
     }
 
     // Look up prices and insert new items
@@ -1686,12 +1819,43 @@ router.put('/:id/loan/pay', authenticate, authorize('owner', 'admin', 'cashier')
     );
 
     if (loanRes.rows[0]) {
-      // Mark the existing loan as paid
+      // ── Mark the existing loan as paid AND record the money (2026-08-15) ───
+      // Settling a loan is the moment cash physically arrives, but this route
+      // only ever flipped the loan's status — no cash_flow row was written here
+      // or anywhere else in the codebase. Live data at the time of the fix:
+      // 6 settled loans, 800,317.60 so'm collected and invisible to every cash
+      // flow report. (Counterpart to the double-payment bug, which inflated the
+      // same reports by 1,682,475 — two faults pulling opposite ways, which is
+      // why no single total ever looked obviously wrong.)
+      //
+      // `AND status <> 'paid'` makes this idempotent: re-settling an already
+      // settled loan returns it unchanged and writes NO second cash row. Same
+      // reasoning as the duplicate-payment guard — this route is reachable from
+      // a button a human can press twice.
       const updated = await db.query(
-        `UPDATE loans SET status='paid', paid_at=NOW(), updated_at=NOW() WHERE id=$1 RETURNING *`,
+        `UPDATE loans SET status='paid', paid_at=NOW(), updated_at=NOW()
+          WHERE id=$1 AND status <> 'paid' RETURNING *`,
         [loanRes.rows[0].id]
       );
-      return res.json(updated.rows[0]);
+      if (!updated.rows[0]) {
+        const current = await db.query(`SELECT * FROM loans WHERE id=$1`, [loanRes.rows[0].id]);
+        return res.json({ ...current.rows[0], alreadySettled: true });
+      }
+      const loan = updated.rows[0];
+      try {
+        await db.query(
+          `INSERT INTO cash_flow (type, amount, description, recorded_by, restaurant_id)
+           VALUES ('in', $1, $2, $3, $4)`,
+          [loan.amount, `Loan repayment for order #${String(req.params.id).slice(0, 8)}`,
+           req.user.id, rid(req)]
+        );
+      } catch (e) {
+        // The loan IS settled — that write already committed. Losing the cash
+        // row here would silently under-report income, so it is logged loudly
+        // rather than swallowed, but it must not fail the settlement response.
+        console.error('[loan/pay] loan settled but cash_flow insert failed:', e.message);
+      }
+      return res.json(loan);
     }
 
     // No loan record found — create one from the order data and mark it as paid
@@ -1714,6 +1878,19 @@ router.put('/:id/loan/pay', authenticate, authorize('owner', 'admin', 'cashier')
         rid(req)
       ]
     );
+    // Same as the branch above: this path also settles a loan (it creates it
+    // already marked 'paid'), so the cash it represents must be recorded too.
+    // Missing this was half of the 800,317.60 that never reached cash flow.
+    try {
+      await db.query(
+        `INSERT INTO cash_flow (type, amount, description, recorded_by, restaurant_id)
+         VALUES ('in', $1, $2, $3, $4)`,
+        [order.total_amount, `Loan repayment for order #${String(req.params.id).slice(0, 8)}`,
+         req.user.id, rid(req)]
+      );
+    } catch (e) {
+      console.error('[loan/pay] loan created as paid but cash_flow insert failed:', e.message);
+    }
     return res.json(created.rows[0]);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1748,7 +1925,7 @@ router.post('/:id/refund', authenticate, authorize('owner', 'admin', 'cashier', 
   try {
     await client.query('BEGIN');
 
-    const existing = await client.query('SELECT * FROM orders WHERE id=$1 AND restaurant_id=$2', [req.params.id, rid(req)]);
+    const existing = await client.query('SELECT * FROM orders WHERE id=$1 AND restaurant_id=$2 FOR UPDATE', [req.params.id, rid(req)]);
     if (!existing.rows[0]) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Order not found' }); }
     const order = existing.rows[0];
     if (order.status !== 'paid') { await client.query('ROLLBACK'); return res.status(400).json({ error: 'Only paid orders can be refunded' }); }
