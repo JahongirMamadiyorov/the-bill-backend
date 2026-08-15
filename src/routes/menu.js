@@ -30,7 +30,7 @@ const upload = multer({
 });
 
 // POST /api/menu/upload-image
-router.post('/upload-image', authenticate, upload.single('image'), (req, res) => {
+router.post('/upload-image', authenticate, authorize('owner','admin'), upload.single('image'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
   // Return both a relative path (for web proxy) and a full URL (for native app)
   const relativePath = `/uploads/menu/${req.file.filename}`;
@@ -96,7 +96,7 @@ router.get('/stations', authenticate, async (req, res) => {
 });
 
 // POST /api/menu/stations — add a custom station for this restaurant
-router.post('/stations', authenticate, async (req, res) => {
+router.post('/stations', authenticate, authorize('owner','admin'), async (req, res) => {
   const { name } = req.body;
   if (!name || !String(name).trim()) return res.status(400).json({ error: 'Name required' });
   try {
@@ -115,7 +115,7 @@ router.post('/stations', authenticate, async (req, res) => {
 
 // DELETE /api/menu/stations/:name — remove a custom station for this restaurant
 // Blocks deletion if active staff members are assigned to this station.
-router.delete('/stations/:name', authenticate, async (req, res) => {
+router.delete('/stations/:name', authenticate, authorize('owner','admin'), async (req, res) => {
   try {
     const restaurant_id = rid(req);
     // Check if any active staff is assigned to this station

@@ -259,9 +259,16 @@ router.patch('/delivery-items/:itemId/remove', authenticate, authorize('owner', 
   try {
     await ensureDeliveryItemsTable();
     const { remove_reason } = req.body || {};
+    // SECURITY (fixed 2026-08-09): this updated by id ALONE, so an authenticated
+    // admin at one restaurant could modify another restaurant's delivery line —
+    // and the recalculation below then rewrote that restaurant's delivery total.
+    // The route directly above already scoped correctly; this one was missed.
+    // delivery_items.restaurant_id exists as of the 2026-07-31 denormalisation.
+    const restaurantId = rid(req);
     const result = await db.query(`
-      UPDATE delivery_items SET removed = TRUE, remove_reason = $2 WHERE id = $1 RETURNING *
-    `, [req.params.itemId, remove_reason || '']);
+      UPDATE delivery_items SET removed = TRUE, remove_reason = $2
+       WHERE id = $1 AND restaurant_id = $3 RETURNING *
+    `, [req.params.itemId, remove_reason || '', restaurantId]);
     if (!result.rows.length) return res.status(404).json({ error: 'Item not found' });
     // Recalculate delivery total from non-removed items
     const item = result.rows[0];
@@ -281,9 +288,13 @@ router.patch('/delivery-items/:itemId/update-qty', authenticate, authorize('owne
     await ensureDeliveryItemsTable();
     const { qty } = req.body;
     if (qty === undefined) return res.status(400).json({ error: 'qty is required' });
+    // SECURITY (fixed 2026-08-09): same cross-restaurant hole as the remove route
+    // above — updated by id alone with no ownership check.
+    const restaurantId = rid(req);
     const result = await db.query(`
-      UPDATE delivery_items SET qty = $2 WHERE id = $1 RETURNING *
-    `, [req.params.itemId, parseFloat(qty) || 0]);
+      UPDATE delivery_items SET qty = $2
+       WHERE id = $1 AND restaurant_id = $3 RETURNING *
+    `, [req.params.itemId, parseFloat(qty) || 0, restaurantId]);
     if (!result.rows.length) return res.status(404).json({ error: 'Item not found' });
     // Recalculate delivery total
     const item = result.rows[0];

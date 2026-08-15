@@ -214,8 +214,16 @@ async function sendKitchenPrintJobs({ db, restaurantId, order, items }) {
         const printerItems = items.filter(item => {
           if (catchAll) return true;                          // printer handles everything
           const station = (item.kitchen_station || '').trim();
-          if (!station) return true;                          // unassigned item → all printers
-          return assignedStations.some(s => s.toLowerCase() === station.toLowerCase());
+          // FIXED 2026-08-09: this used to `return true` for an item with no
+          // station, sending it to EVERY station-assigned printer — invisible in
+          // a one-printer venue, but a duplicate slip on every printer once there
+          // are two or more. Unstationed items belong to a catch-all printer,
+          // which the `catchAll` branch above already handles. Same bug was fixed
+          // in pos-app/printEngine.js; kept in step so the two don't drift.
+          if (!station) return false;
+          // Station entries come from a JSONB column and are not guaranteed to be
+          // strings — String() prevents a non-string entry throwing here.
+          return assignedStations.some(s => String(s).toLowerCase() === station.toLowerCase());
         });
 
         return { printer, printerItems };

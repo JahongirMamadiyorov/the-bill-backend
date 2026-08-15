@@ -7,6 +7,21 @@
 const express = require('express');
 const net     = require('net');
 const router  = express.Router();
+const { authenticate, authorize } = require('../middleware/auth');
+
+// ── SECURITY (fixed 2026-08-09, found by the full audit) ─────────────────────
+// This router had NO authentication of any kind while being mounted publicly at
+// /api/print. Combined with the route below taking `printerIp` and `printerPort`
+// straight from the request body and opening a TCP connection to them, that was
+// an UNAUTHENTICATED SERVER-SIDE REQUEST FORGERY vector: anyone on the internet
+// could make this server connect to any host:port and write arbitrary bytes to
+// it — useful for probing internal services from inside the hosting network.
+//
+// Every legitimate caller (the website's printAPI) already sends a Bearer token
+// via its axios interceptor, so requiring auth breaks nothing. Roles mirror who
+// is allowed to take a payment, since that is when a receipt is printed.
+// pos-app does NOT use this route at all — it prints over the LAN itself.
+router.use(authenticate, authorize('owner', 'admin', 'cashier', 'new_cashier'));
 
 // ── ESC/POS byte constants ────────────────────────────────────────────────────
 const ESC = '\x1b';

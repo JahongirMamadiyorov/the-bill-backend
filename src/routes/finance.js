@@ -4,7 +4,12 @@ const db      = require('../config/db');
 const { authenticate, authorize, rid } = require('../middleware/auth');
 
 // All finance routes require authentication
-router.use(authenticate);
+// SECURITY (2026-08-09 audit): this was `authenticate` only, so ANY logged-in
+// user — including a waitress — could create, edit and delete expenses, loans
+// and budgets, and read the restaurant's whole financial summary. Every caller
+// is an Admin-panel screen (website financeAPI + pos-app Admin Dashboard), so
+// restricting to owner/admin breaks nothing.
+router.use(authenticate, authorize('owner', 'admin'));
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // GET /api/finance/summary?start=YYYY-MM-DD&end=YYYY-MM-DD
