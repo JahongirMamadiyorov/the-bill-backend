@@ -70,9 +70,13 @@ function diffOrderItems(before, after) {
     for (const r of rows || []) {
       const k = key(r);
       if (!k) continue;
-      const prev = m.get(k) || { qty: 0, name: r.name || null, price: Number(r.unit_price ?? r.unitPrice ?? 0) };
+      const prev = m.get(k) || {
+        qty: 0, name: r.name || null, unit: r.unit || null,
+        price: Number(r.unit_price ?? r.unitPrice ?? 0),
+      };
       prev.qty += Number(r.quantity ?? r.qty ?? 0) || 0;
       if (!prev.name && r.name) prev.name = r.name;
+      if (!prev.unit && r.unit) prev.unit = r.unit;
       m.set(k, prev);
     }
     return m;
@@ -82,11 +86,15 @@ function diffOrderItems(before, after) {
   const changes = [];
   for (const [k, bv] of b) {
     const av = a.get(k);
-    if (!av)                    changes.push({ action: 'item_added',   details: { item: bv.name, quantity: bv.qty, price: bv.price } });
-    else if (av.qty !== bv.qty) changes.push({ action: 'item_qty_changed', details: { item: bv.name || av.name, from: av.qty, to: bv.qty } });
+    // `unit` is carried on every change so the reader can render "2 kg" rather
+    // than "× 2" for weighed goods. Falls back to the before-side unit when the
+    // after-side lookup missed (deleted menu item), then to null, which the
+    // frontend renders as a plain count.
+    if (!av)                    changes.push({ action: 'item_added',   details: { item: bv.name, quantity: bv.qty, price: bv.price, unit: bv.unit } });
+    else if (av.qty !== bv.qty) changes.push({ action: 'item_qty_changed', details: { item: bv.name || av.name, from: av.qty, to: bv.qty, unit: bv.unit || av.unit } });
   }
   for (const [k, av] of a) {
-    if (!b.has(k))              changes.push({ action: 'item_removed', details: { item: av.name, quantity: av.qty } });
+    if (!b.has(k))              changes.push({ action: 'item_removed', details: { item: av.name, quantity: av.qty, unit: av.unit } });
   }
   return changes;
 }
@@ -692,7 +700,11 @@ router.put('/:id', authenticate, authorize('owner', 'admin', 'cashier', 'waitres
     let auditBeforeItems = [];
     try {
       auditBeforeItems = (await client.query(
-        `SELECT oi.menu_item_id, oi.quantity, oi.unit_price, m.name
+        // m.unit is selected for the audit trail: several products are sold by
+        // weight or volume (kg, l), and "KFC 1 -> 2" is meaningless for those —
+        // it has to read "1 kg -> 2 kg". Without carrying the unit through here
+        // the history silently turns every weighed item into a piece count.
+        `SELECT oi.menu_item_id, oi.quantity, oi.unit_price, m.name, m.unit
            FROM order_items oi LEFT JOIN menu_items m ON m.id = oi.menu_item_id
           WHERE oi.order_id = $1`, [req.params.id])).rows;
     } catch (_) { /* audit must never break the edit */ }
@@ -898,8 +910,8 @@ router.put('/:id', authenticate, authorize('owner', 'admin', 'cashier', 'waitres
       try {
         const ids = [...new Set(items.map((i) => i.menu_item_id).filter(Boolean))];
         if (ids.length) {
-          const rows = (await db.query('SELECT id, name FROM menu_items WHERE id = ANY($1)', [ids])).rows;
-          newNameMap = Object.fromEntries(rows.map((r) => [r.id, r.name]));
+          const rows = (await db.query('SELECT id, name, unit FROM menu_items WHERE id = ANY($1)', [ids])).rows;
+          newNameMap = Object.fromEntries(rows.map((r) => [r.id, r]));
         }
       } catch (_) { /* audit never breaks the edit */ }
 
@@ -907,7 +919,8 @@ router.put('/:id', authenticate, authorize('owner', 'admin', 'cashier', 'waitres
         menu_item_id: it.menu_item_id,
         quantity: it.quantity,
         unit_price: it.unit_price,
-        name: newNameMap[it.menu_item_id] || null,
+        name: newNameMap[it.menu_item_id]?.name || null,
+        unit: newNameMap[it.menu_item_id]?.unit || null,
       }));
       for (const c of diffOrderItems(auditBeforeItems, afterRows)) {
         await logOrderChange(req, {
@@ -971,10 +984,15 @@ router.post('/', authenticate, async (req, res) => {
     // Resolve unit prices + names — fetch from menu_items for any item missing a price
     const menuItemIds = [...new Set(items.map(i => i.menu_item_id))];
     const menuPriceRows = menuItemIds.length
-      ? (await client.query(`SELECT id, price, name FROM menu_items WHERE id = ANY($1) AND restaurant_id=$2`, [menuItemIds, rid(req)])).rows
+      ? (await client.query(`SELECT id, price, name, unit FROM menu_items WHERE id = ANY($1) AND restaurant_id=$2`, [menuItemIds, rid(req)])).rows
       : [];
     const menuPriceMap = Object.fromEntries(menuPriceRows.map(r => [r.id, parseFloat(r.price || 0)]));
     const menuNameMap  = Object.fromEntries(menuPriceRows.map(r => [r.id, r.name || r.id]));
+    // Separate map on purpose — menuNameMap holds plain STRINGS and is also used
+    // to build stock-movement descriptions below; turning it into row objects
+    // would render "[object Object]" into those. The audit needs the unit so
+    // weighed goods read "1.5 kg" instead of "× 1.5".
+    const menuUnitMap  = Object.fromEntries(menuPriceRows.map(r => [r.id, r.unit || null]));
 
     let subtotal = 0;
     for (const item of items) {
@@ -1124,7 +1142,9 @@ router.post('/', authenticate, async (req, res) => {
       details: {
         orderType: order_type,
         items: (items || []).map((i) => ({
-          item: menuNameMap[i.menu_item_id] || null, quantity: i.quantity,
+          item:     menuNameMap[i.menu_item_id] || null,
+          quantity: i.quantity,
+          unit:     menuUnitMap[i.menu_item_id] || null,
         })),
       },
     });
@@ -1705,13 +1725,19 @@ router.post('/:id/items', authenticate, async (req, res) => {
       if (added.length) {
         const ids = [...new Set(added.map((i) => i.menu_item_id).filter(Boolean))];
         const nameRows = ids.length
-          ? (await db.query('SELECT id, name FROM menu_items WHERE id = ANY($1)', [ids])).rows : [];
-        const nameMap = Object.fromEntries(nameRows.map((r) => [r.id, r.name]));
+          ? (await db.query('SELECT id, name, unit FROM menu_items WHERE id = ANY($1)', [ids])).rows : [];
+        // Keep the whole row, not just the name: the history renders weighed
+        // goods as "1.5 kg" and needs the unit as well as the label.
+        const nameMap = Object.fromEntries(nameRows.map((r) => [r.id, r]));
         const dn = (await db.query('SELECT daily_number FROM orders WHERE id=$1', [req.params.id])).rows[0]?.daily_number;
         for (const it of added) {
           await logOrderChange(req, {
             orderId: req.params.id, orderNumber: dn, action: 'item_added',
-            details: { item: nameMap[it.menu_item_id] || null, quantity: it.quantity },
+            details: {
+              item:     nameMap[it.menu_item_id]?.name || null,
+              quantity: it.quantity,
+              unit:     nameMap[it.menu_item_id]?.unit || null,
+            },
           });
         }
       }
