@@ -74,7 +74,32 @@ router.put('/', authenticate, authorize(...ALLOWED_ROLES), async (req, res) => {
       kitchen_show_order_type,
       kitchen_show_item_price,
       kitchen_show_qty_unit,
+      // Per-weekday opening/closing times (2026-08-17). See the column COMMENT in
+      // the DB and lib/businessDay.js for how close<open (a night running past
+      // midnight) decides which business day a late sale counts under.
+      working_hours,
     } = req.body;
+
+    // Validate before it reaches the database. This is free-text from an admin
+    // form; a malformed shape here would silently break the business-day
+    // calculation for every report, which is far harder to notice than a
+    // rejected save. Unknown keys are dropped rather than stored.
+    const DAY_KEYS = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];
+    const HHMM = /^([01]\d|2[0-3]):([0-5]\d)$/;
+    let cleanHours = {};
+    if (working_hours && typeof working_hours === 'object' && !Array.isArray(working_hours)) {
+      for (const d of DAY_KEYS) {
+        const v = working_hours[d];
+        if (!v || typeof v !== 'object') continue;
+        const open  = HHMM.test(v.open)  ? v.open  : null;
+        const close = HHMM.test(v.close) ? v.close : null;
+        const closed = v.closed === true;
+        // A day is only stored if it is either explicitly closed or has BOTH
+        // times. Half-filled rows would make the boundary ambiguous.
+        if (closed)                 cleanHours[d] = { closed: true };
+        else if (open && close)     cleanHours[d] = { closed: false, open, close };
+      }
+    }
 
     const result = await db.query(
       `INSERT INTO restaurant_settings (
@@ -88,11 +113,12 @@ router.put('/', authenticate, authorize(...ALLOWED_ROLES), async (req, res) => {
          kitchen_show_notes, kitchen_show_timestamp,
          kitchen_show_order_type, kitchen_show_item_price, kitchen_show_qty_unit,
          receipt_auto_print,
+         working_hours,
          updated_at
        ) VALUES (
          $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
          $13::jsonb, $14::jsonb,
-         $15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,now()
+         $15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30::jsonb,now()
        )
        ON CONFLICT (restaurant_id) DO UPDATE SET
          restaurant_name         = EXCLUDED.restaurant_name,
@@ -123,6 +149,7 @@ router.put('/', authenticate, authorize(...ALLOWED_ROLES), async (req, res) => {
          kitchen_show_item_price      = EXCLUDED.kitchen_show_item_price,
          kitchen_show_qty_unit        = EXCLUDED.kitchen_show_qty_unit,
          receipt_auto_print           = EXCLUDED.receipt_auto_print,
+         working_hours                = EXCLUDED.working_hours,
          updated_at              = now()
        RETURNING *`,
       [
@@ -156,6 +183,7 @@ router.put('/', authenticate, authorize(...ALLOWED_ROLES), async (req, res) => {
         kitchen_show_qty_unit        ?? true,
         // Defaults TRUE, matching the website's PayModal which always printed on payment.
         receipt_auto_print           ?? true,
+        JSON.stringify(cleanHours),
       ]
     );
 
