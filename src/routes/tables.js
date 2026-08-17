@@ -1,5 +1,15 @@
 const express = require('express');
 const router = express.Router();
+
+
+// What a table is CALLED. Restaurants name their tables ("Xoli 1", "VIP"), and
+// that name is what staff use — a generated "Table 3" is a different thing to
+// the person reading the notification. Mirrors the app's utils/tableLabel.js.
+function tableDisplayName(row) {
+  const name = String(row?.name ?? '').trim();
+  if (name) return name;
+  return row?.table_number != null ? `Table ${row.table_number}` : 'Table';
+}
 const db = require('../config/db');
 const { authenticate, authorize, rid } = require('../middleware/auth');
 
@@ -252,9 +262,21 @@ router.put('/:id/open', authenticate, async (req, res) => {
     );
     if (!result.rows.length) return res.status(404).json({ error: 'Table not found' });
 
+    // title/body stay in English as the fallback for older clients; the *_key
+    // columns are what a translating client actually renders (see the column
+    // comments). body_params carries the table's real NAME — "Xoli 1" — not a
+    // generated "Table 1", which is what the staff actually call it.
     db.query(
-      "INSERT INTO notifications (user_id, title, body, type, restaurant_id) VALUES ($1,$2,$3,$4,$5)",
-      [req.user.id, "Table Opened", `Table ${result.rows[0].table_number} is now occupied.`, "table_status", restaurantId]
+      `INSERT INTO notifications (user_id, title, body, type, restaurant_id, title_key, body_key, body_params)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb)`,
+      [
+        req.user.id,
+        "Table Opened",
+        `${tableDisplayName(result.rows[0])} is now occupied.`,
+        "table_status", restaurantId,
+        'notif.tableOpened.title', 'notif.tableOpened.body',
+        JSON.stringify({ table: tableDisplayName(result.rows[0]) }),
+      ]
     ).catch(() => {});
 
     res.json(result.rows[0]);
@@ -281,8 +303,16 @@ router.put('/:id/close', authenticate, async (req, res) => {
     if (!result.rows.length) return res.status(404).json({ error: 'Table not found' });
 
     db.query(
-      "INSERT INTO notifications (user_id, title, body, type, restaurant_id) VALUES ($1,$2,$3,$4,$5)",
-      [req.user.id, "Table Closed", `Table ${result.rows[0].table_number} is now free.`, "table_status", restaurantId]
+      `INSERT INTO notifications (user_id, title, body, type, restaurant_id, title_key, body_key, body_params)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb)`,
+      [
+        req.user.id,
+        "Table Closed",
+        `${tableDisplayName(result.rows[0])} is now free.`,
+        "table_status", restaurantId,
+        'notif.tableClosed.title', 'notif.tableClosed.body',
+        JSON.stringify({ table: tableDisplayName(result.rows[0]) }),
+      ]
     ).catch(() => {});
 
     res.json(result.rows[0]);
