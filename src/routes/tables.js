@@ -319,6 +319,88 @@ router.put('/:id/close', authenticate, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// PUT /api/tables/:id/reserve — hold a free table for a named guest.
+//
+// Deliberately its OWN route rather than widening `PUT /api/tables/:id`
+// (2026-08-17). That generic update also accepts name, capacity, section and
+// shape — floor-layout fields a cashier has no business changing — and it is
+// restricted to owner/admin/waitress for exactly that reason. Reserving is a
+// front-of-house action a cashier does dozens of times a night, so it gets a
+// narrow endpoint that can ONLY touch reservation fields and the status.
+//
+// Refuses to reserve an occupied table: the guests sitting there have not
+// finished, and silently marking their table reserved would hide their live
+// order from the floor plan.
+router.put('/:id/reserve', authenticate,
+  authorize('owner', 'admin', 'cashier', 'new_cashier', 'waitress', 'new_waiter'),
+  async (req, res) => {
+    const restaurantId = rid(req);
+    const guest = String(req.body.reservation_guest ?? req.body.guest ?? '').trim();
+    if (!guest) return res.status(400).json({ error: 'A guest name is required' });
+
+    try {
+      const current = await db.query(
+        'SELECT status FROM restaurant_tables WHERE id = $1 AND restaurant_id = $2',
+        [req.params.id, restaurantId]
+      );
+      if (!current.rows.length) return res.status(404).json({ error: 'Table not found' });
+      if (current.rows[0].status === 'occupied') {
+        return res.status(409).json({
+          error: 'This table is occupied — close its order before reserving it.',
+          code: 'TABLE_OCCUPIED',
+        });
+      }
+
+      const result = await db.query(
+        `UPDATE restaurant_tables
+            SET status = 'reserved',
+                reservation_guest = $1,
+                reservation_phone = $2,
+                reservation_date  = $3,
+                reservation_time  = $4
+          WHERE id = $5 AND restaurant_id = $6 RETURNING *`,
+        [
+          guest,
+          req.body.reservation_phone ?? req.body.phone ?? null,
+          req.body.reservation_date  ?? req.body.date  ?? null,
+          req.body.reservation_time  ?? req.body.time  ?? null,
+          req.params.id, restaurantId,
+        ]
+      );
+      res.json(result.rows[0]);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+  });
+
+// PUT /api/tables/:id/unreserve — release a held table back to free.
+//
+// Only ever acts on a RESERVED table. Guarding on the status means a mistaken
+// tap cannot free a table that has since been seated and has a live order on
+// it — that would strand the order with no table on the floor plan.
+router.put('/:id/unreserve', authenticate,
+  authorize('owner', 'admin', 'cashier', 'new_cashier', 'waitress', 'new_waiter'),
+  async (req, res) => {
+    try {
+      const restaurantId = rid(req);
+      const result = await db.query(
+        `UPDATE restaurant_tables
+            SET status = 'free',
+                reservation_guest = NULL,
+                reservation_phone = NULL,
+                reservation_date  = NULL,
+                reservation_time  = NULL
+          WHERE id = $1 AND restaurant_id = $2 AND status = 'reserved' RETURNING *`,
+        [req.params.id, restaurantId]
+      );
+      if (!result.rows.length) {
+        return res.status(409).json({
+          error: 'That table is not reserved.',
+          code: 'NOT_RESERVED',
+        });
+      }
+      res.json(result.rows[0]);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+  });
+
 // PUT /api/tables/:id/transfer
 router.put('/:id/transfer', authenticate, async (req, res) => {
   const { new_waitress_id } = req.body;
