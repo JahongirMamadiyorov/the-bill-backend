@@ -212,15 +212,22 @@ async function sendKitchenPrintJobs({ db, restaurantId, order, items }) {
         const catchAll = assignedStations.length === 0;
 
         const printerItems = items.filter(item => {
-          if (catchAll) return true;                          // printer handles everything
           const station = (item.kitchen_station || '').trim();
+          // OWNER RULE 2026-08-19: an item with NO kitchen_station is NEVER
+          // printed to the kitchen — including on a catch-all printer, which
+          // used to receive it via the `catchAll` short-circuit that stood
+          // here. Drinks and counter items carry no station and were producing
+          // kitchen slips for food the kitchen does not cook. This checks
+          // BEFORE the catch-all branch on purpose; putting it after would let
+          // an unassigned printer keep printing them. Reverses the 2026-08-09
+          // "every item must reach some printer" decision. Mirrored in
+          // pos-app/printEngine.js — keep the two in step.
+          if (!station) return false;
+          if (catchAll) return true;                          // printer handles everything
           // FIXED 2026-08-09: this used to `return true` for an item with no
           // station, sending it to EVERY station-assigned printer — invisible in
           // a one-printer venue, but a duplicate slip on every printer once there
-          // are two or more. Unstationed items belong to a catch-all printer,
-          // which the `catchAll` branch above already handles. Same bug was fixed
-          // in pos-app/printEngine.js; kept in step so the two don't drift.
-          if (!station) return false;
+          // are two or more.
           // Station entries come from a JSONB column and are not guaranteed to be
           // strings — String() prevents a non-string entry throwing here.
           return assignedStations.some(s => String(s).toLowerCase() === station.toLowerCase());
